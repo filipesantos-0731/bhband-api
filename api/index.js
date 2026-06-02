@@ -118,6 +118,25 @@ function calculatePrice(quantity, unitCost, technique = 'Nenhuma', strategy = 'P
 
 // ========== ENDPOINTS ==========
 
+// Rota raiz - informações da API
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    api: 'BHBAND Calculadora de Preços',
+    versao: '1.0.0',
+    endpoints: {
+      health: 'GET /api/health',
+      calcular: 'POST /api/calcular-orcamento',
+      comparar: 'POST /api/comparar-estrategias',
+      tecnicas: 'GET /api/tecnicas',
+      estrategias: 'GET /api/estrategias'
+    },
+    documentacao: 'Leia o README.md no repositório',
+    repositorio: 'https://github.com/filipesantos-0731/bhband-api',
+    timestamp: new Date().toISOString()
+  });
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
