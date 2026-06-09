@@ -317,10 +317,15 @@ app.get('/api/produtos', (req, res) => {
     tags = '',
     preco_min = 0,
     preco_max = Infinity,
-    ordenar = 'titulo'
+    ordenar = 'titulo',
+    com_imagem = 'true'
   } = req.query;
 
   let produtos = CATALOG.produtos;
+
+  if (com_imagem !== 'false') {
+    produtos = produtos.filter(p => p.imagem_principal);
+  }
 
   if (busca) {
     const q = busca.toLowerCase();
