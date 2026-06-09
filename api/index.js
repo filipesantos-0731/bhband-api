@@ -2,9 +2,18 @@ import express from 'express';
 import axios from 'axios';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { readFileSync, existsSync } from 'fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
+
+// ========== CATÁLOGO DE PRODUTOS ==========
+let CATALOG = { total: 0, atualizado_em: '', produtos: [] };
+const catalogPath = join(__dirname, '..', 'products.json');
+if (existsSync(catalogPath)) {
+  CATALOG = JSON.parse(readFileSync(catalogPath, 'utf-8'));
+  console.log(`📦 Catálogo carregado: ${CATALOG.total} produtos`);
+}
 
 // Middleware
 app.use(express.json());
@@ -127,7 +136,12 @@ app.get('/', (req, res) => {
     versao: '1.0.0',
     endpoints: {
       health: 'GET /api/health',
+      catalogo: 'GET /api/catalogo',
+      produtos: 'GET /api/produtos?busca=&tipo=&pagina=&limite=',
+      produto: 'GET /api/produtos/:handle',
+      tipos: 'GET /api/tipos',
       calcular: 'POST /api/calcular-orcamento',
+      calcular_produto: 'POST /api/calcular-produto',
       comparar: 'POST /api/comparar-estrategias',
       tecnicas: 'GET /api/tecnicas',
       estrategias: 'GET /api/estrategias'
@@ -290,6 +304,147 @@ Personalização: ${technique}
 
 Vamos seguir com o seu pedido e garantir essa condição especial?`;
 }
+
+// ========== ENDPOINTS DE PRODUTOS ==========
+
+// Listar produtos com paginação e filtros
+app.get('/api/produtos', (req, res) => {
+  const {
+    pagina = 1,
+    limite = 50,
+    busca = '',
+    tipo = '',
+    tags = '',
+    preco_min = 0,
+    preco_max = Infinity,
+    ordenar = 'titulo'
+  } = req.query;
+
+  let produtos = CATALOG.produtos;
+
+  if (busca) {
+    const q = busca.toLowerCase();
+    produtos = produtos.filter(p =>
+      p.titulo.toLowerCase().includes(q) ||
+      p.tipo.toLowerCase().includes(q) ||
+      (p.tags && p.tags.some(t => t.toLowerCase().includes(q)))
+    );
+  }
+
+  if (tipo) {
+    produtos = produtos.filter(p => p.tipo.toLowerCase() === tipo.toLowerCase());
+  }
+
+  if (tags) {
+    const tagList = tags.split(',').map(t => t.trim().toLowerCase());
+    produtos = produtos.filter(p =>
+      p.tags && tagList.some(tag => p.tags.some(t => t.toLowerCase().includes(tag)))
+    );
+  }
+
+  const pMin = parseFloat(preco_min) || 0;
+  const pMax = parseFloat(preco_max) || Infinity;
+  if (pMin > 0 || pMax < Infinity) {
+    produtos = produtos.filter(p => p.preco_min >= pMin && p.preco_min <= pMax);
+  }
+
+  if (ordenar === 'preco_asc') produtos.sort((a, b) => a.preco_min - b.preco_min);
+  else if (ordenar === 'preco_desc') produtos.sort((a, b) => b.preco_min - a.preco_min);
+  else produtos.sort((a, b) => a.titulo.localeCompare(b.titulo));
+
+  const total = produtos.length;
+  const pg = parseInt(pagina);
+  const lim = Math.min(parseInt(limite), 250);
+  const inicio = (pg - 1) * lim;
+  const pagina_produtos = produtos.slice(inicio, inicio + lim);
+
+  res.json({
+    total,
+    pagina: pg,
+    limite: lim,
+    total_paginas: Math.ceil(total / lim),
+    atualizado_em: CATALOG.atualizado_em,
+    produtos: pagina_produtos
+  });
+});
+
+// Buscar produto por handle
+app.get('/api/produtos/:handle', (req, res) => {
+  const produto = CATALOG.produtos.find(p => p.handle === req.params.handle);
+  if (!produto) {
+    return res.status(404).json({ erro: 'Produto não encontrado', handle: req.params.handle });
+  }
+  res.json(produto);
+});
+
+// Listar tipos de produto
+app.get('/api/tipos', (req, res) => {
+  const tipos = {};
+  CATALOG.produtos.forEach(p => {
+    const tipo = p.tipo || 'Sem categoria';
+    tipos[tipo] = (tipos[tipo] || 0) + 1;
+  });
+  res.json({
+    tipos: Object.entries(tipos)
+      .sort((a, b) => b[1] - a[1])
+      .map(([nome, quantidade]) => ({ nome, quantidade }))
+  });
+});
+
+// Calcular orçamento para um produto do catálogo
+app.post('/api/calcular-produto', (req, res) => {
+  try {
+    const { handle, quantidade, personalizacao, estrategia = 'PADRÃO' } = req.body;
+
+    if (!handle || !quantidade) {
+      return res.status(400).json({ erro: 'handle e quantidade são obrigatórios' });
+    }
+
+    const produto = CATALOG.produtos.find(p => p.handle === handle);
+    if (!produto) {
+      return res.status(404).json({ erro: 'Produto não encontrado' });
+    }
+
+    const custoUnitario = produto.preco_min;
+    const totalProductCost = quantidade * custoUnitario;
+
+    if (totalProductCost < 400) {
+      return res.status(400).json({
+        erro: 'Valor do pedido abaixo do mínimo',
+        custo_total: totalProductCost,
+        minimo_permitido: 400,
+        quantidade_minima: Math.ceil(400 / custoUnitario)
+      });
+    }
+
+    const resultado = calculatePrice(quantidade, custoUnitario, personalizacao || 'Nenhuma', estrategia);
+
+    res.json({
+      sucesso: true,
+      produto: {
+        titulo: produto.titulo,
+        handle: produto.handle,
+        imagem: produto.imagem_principal,
+        url: produto.url,
+        preco_custo: custoUnitario
+      },
+      calculo: resultado,
+      orcamento_whatsapp: gerarMensagemWhatsApp(resultado, produto.titulo)
+    });
+
+  } catch (erro) {
+    res.status(500).json({ erro: erro.message });
+  }
+});
+
+// Info do catálogo
+app.get('/api/catalogo', (req, res) => {
+  res.json({
+    total_produtos: CATALOG.total,
+    atualizado_em: CATALOG.atualizado_em,
+    fonte: CATALOG.fonte
+  });
+});
 
 // ========== FALLBACK 404 ==========
 app.all('*', (req, res) => {

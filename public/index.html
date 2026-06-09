@@ -388,13 +388,178 @@
             color: #5D2E91;
         }
 
+        /* CATÁLOGO */
+        .catalogo-toolbar {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .catalogo-toolbar input[type="text"],
+        .catalogo-toolbar select {
+            padding: 9px 12px;
+            border: 1px solid #DDD;
+            border-radius: 4px;
+            font-size: 14px;
+            font-family: inherit;
+        }
+
+        .catalogo-toolbar input[type="text"] {
+            flex: 1;
+            min-width: 200px;
+        }
+
+        .catalogo-toolbar input:focus,
+        .catalogo-toolbar select:focus {
+            outline: none;
+            border-color: #5D2E91;
+        }
+
+        .catalogo-info {
+            font-size: 13px;
+            color: #666;
+            margin-bottom: 15px;
+        }
+
+        .produtos-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 16px;
+        }
+
+        .produto-card {
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            transition: box-shadow 0.2s, transform 0.2s;
+            cursor: pointer;
+        }
+
+        .produto-card:hover {
+            box-shadow: 0 4px 12px rgba(93, 46, 145, 0.2);
+            transform: translateY(-2px);
+        }
+
+        .produto-card img {
+            width: 100%;
+            height: 170px;
+            object-fit: cover;
+            background: #F4F4F6;
+        }
+
+        .produto-card-body {
+            padding: 12px;
+        }
+
+        .produto-card-titulo {
+            font-size: 13px;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 6px;
+            line-height: 1.4;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .produto-card-preco {
+            font-size: 15px;
+            font-weight: 700;
+            color: #5D2E91;
+        }
+
+        .produto-card-tipo {
+            font-size: 11px;
+            color: #999;
+            margin-top: 4px;
+        }
+
+        .produto-card-btn {
+            margin-top: 8px;
+            width: 100%;
+            padding: 7px;
+            background: #5D2E91;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .produto-card-btn:hover { background: #3A1869; }
+
+        .catalogo-paginacao {
+            display: flex;
+            justify-content: center;
+            gap: 8px;
+            margin-top: 24px;
+            flex-wrap: wrap;
+        }
+
+        .pag-btn {
+            padding: 7px 13px;
+            border: 1px solid #DDD;
+            background: white;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+
+        .pag-btn.active {
+            background: #5D2E91;
+            color: white;
+            border-color: #5D2E91;
+        }
+
+        .pag-btn:hover:not(.active) { background: #F3E5F5; }
+
+        /* MODAL PRODUTO */
+        .modal-produto-img {
+            width: 100%;
+            max-height: 280px;
+            object-fit: cover;
+            border-radius: 6px;
+            margin-bottom: 16px;
+        }
+
+        .produto-detalhe-preco {
+            font-size: 22px;
+            font-weight: 700;
+            color: #5D2E91;
+            margin: 10px 0;
+        }
+
+        .produto-detalhe-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin: 10px 0;
+        }
+
+        .tag-chip {
+            background: #F3E5F5;
+            color: #5D2E91;
+            font-size: 11px;
+            padding: 3px 8px;
+            border-radius: 12px;
+        }
+
         @media (max-width: 768px) {
             .sidebar {
                 width: 200px;
             }
-            
+
             .calculator-grid {
                 grid-template-columns: 1fr;
+            }
+
+            .produtos-grid {
+                grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
             }
         }
     </style>
@@ -565,10 +730,44 @@ curl -X POST https://sua-api.exemplo.com/calcular \
 
                 <!-- CATÁLOGO -->
                 <section id="catalogo" class="section">
+                    <div class="stats" id="catalogo-stats" style="display:none;">
+                        <div class="stat">
+                            <div class="stat-value" id="stat-total-produtos">0</div>
+                            <div class="stat-label">Total de Produtos</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value" id="stat-tipos">0</div>
+                            <div class="stat-label">Categorias</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value" id="stat-preco-medio">R$ 0</div>
+                            <div class="stat-label">Preço Médio</div>
+                        </div>
+                    </div>
+
                     <div class="card">
-                        <h3>Catálogo de Produtos</h3>
-                        <p style="color: #999; font-size: 14px;">Quando você conectar com Google Drive, os produtos aparecerão aqui.</p>
-                        <button class="btn btn-primary" style="margin-top: 15px;">Sincronizar com Google Drive</button>
+                        <div class="catalogo-toolbar">
+                            <input type="text" id="catalogo-busca" placeholder="Buscar produto..." oninput="debounceSearch()">
+                            <select id="catalogo-tipo" onchange="buscarProdutos(1)">
+                                <option value="">Todas as categorias</option>
+                            </select>
+                            <select id="catalogo-ordenar" onchange="buscarProdutos(1)">
+                                <option value="titulo">A-Z</option>
+                                <option value="preco_asc">Menor preço</option>
+                                <option value="preco_desc">Maior preço</option>
+                            </select>
+                            <select id="catalogo-limite" onchange="buscarProdutos(1)">
+                                <option value="48">48 por página</option>
+                                <option value="96">96 por página</option>
+                                <option value="24">24 por página</option>
+                            </select>
+                        </div>
+
+                        <div class="catalogo-info" id="catalogo-info">Carregando produtos...</div>
+
+                        <div class="produtos-grid" id="produtos-grid"></div>
+
+                        <div class="catalogo-paginacao" id="catalogo-paginacao"></div>
                     </div>
                 </section>
 
@@ -588,6 +787,45 @@ curl -X POST https://sua-api.exemplo.com/calcular \
                     </div>
                 </section>
             </div>
+        </div>
+    </div>
+
+    <!-- MODAL PRODUTO -->
+    <div id="modalProduto" class="modal">
+        <div class="modal-content" style="max-width: 600px;">
+            <button class="modal-close" onclick="fecharModalProduto()">×</button>
+            <img id="modal-prod-img" class="modal-produto-img" src="" alt="">
+            <div class="modal-header" id="modal-prod-titulo"></div>
+            <div class="produto-detalhe-preco" id="modal-prod-preco"></div>
+            <div class="produto-detalhe-tags" id="modal-prod-tags"></div>
+            <a id="modal-prod-url" href="#" target="_blank" style="font-size:13px;color:#5D2E91;display:block;margin-bottom:12px;">Ver no site BH Band →</a>
+            <hr style="margin-bottom:16px;border:none;border-top:1px solid #EEE;">
+            <h4 style="margin-bottom:12px;color:#333;">Calcular Preço de Venda</h4>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px;">
+                <div class="form-group" style="margin:0;">
+                    <label>Quantidade</label>
+                    <input type="number" id="modal-qtd" value="500" min="1">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label>Personalização</label>
+                    <select id="modal-tecnica">
+                        <option value="Nenhuma">Nenhuma</option>
+                        <option value="Tampografia">Tampografia</option>
+                        <option value="Serigrafia 1 cor">Serigrafia 1 cor</option>
+                        <option value="Serigrafia 2 cores">Serigrafia 2 cores</option>
+                        <option value="Sublimação">Sublimação</option>
+                        <option value="DTF">DTF</option>
+                        <option value="Gravação a laser">Gravação a laser</option>
+                        <option value="Bordado pequeno">Bordado pequeno</option>
+                    </select>
+                </div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px;">
+                <button class="btn btn-primary btn-small" onclick="calcularProdutoModal('PADRÃO')">Padrão</button>
+                <button class="btn btn-small" style="background:#27AE60;color:white;" onclick="calcularProdutoModal('TETO')">Teto</button>
+                <button class="btn btn-small" style="background:#E67E22;color:white;" onclick="calcularProdutoModal('PISO')">Piso</button>
+            </div>
+            <div id="modal-resultado"></div>
         </div>
     </div>
 
@@ -631,17 +869,16 @@ curl -X POST https://sua-api.exemplo.com/calcular \
         // Estado da aplicação
         let apis = JSON.parse(localStorage.getItem('bhband_apis')) || [];
 
+        let catalogoCarregado = false;
+
         // Função para trocar de seção
         function switchSection(sectionId) {
-            // Remover active de todos
             document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
             document.querySelectorAll('.nav-button').forEach(b => b.classList.remove('active'));
 
-            // Adicionar active ao selecionado
             document.getElementById(sectionId).classList.add('active');
             event.target.classList.add('active');
 
-            // Atualizar título
             const titles = {
                 calculadora: 'Calculadora de Preços',
                 kits: 'Kits / Bundles',
@@ -653,6 +890,13 @@ curl -X POST https://sua-api.exemplo.com/calcular \
                 parametros: 'Configurações Gerais'
             };
             document.getElementById('section-title').textContent = titles[sectionId] || 'BHBAND';
+
+            if (sectionId === 'catalogo' && !catalogoCarregado) {
+                catalogoCarregado = true;
+                carregarTipos();
+                carregarEstatisticas();
+                buscarProdutos(1);
+            }
         }
 
         // Calcular preço
@@ -778,16 +1022,204 @@ curl -X POST https://sua-api.exemplo.com/calcular \
             }
         }
 
+        // ========== CATÁLOGO ==========
+        let catalogoState = { pagina: 1, produto: null };
+        let searchTimeout = null;
+
+        function debounceSearch() {
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(() => buscarProdutos(1), 350);
+        }
+
+        async function buscarProdutos(pagina = 1) {
+            catalogoState.pagina = pagina;
+            const busca = document.getElementById('catalogo-busca').value;
+            const tipo = document.getElementById('catalogo-tipo').value;
+            const ordenar = document.getElementById('catalogo-ordenar').value;
+            const limite = document.getElementById('catalogo-limite').value;
+
+            const params = new URLSearchParams({ pagina, limite, ordenar });
+            if (busca) params.set('busca', busca);
+            if (tipo) params.set('tipo', tipo);
+
+            document.getElementById('catalogo-info').textContent = 'Buscando...';
+            document.getElementById('produtos-grid').innerHTML = '';
+
+            try {
+                const res = await fetch(`/api/produtos?${params}`);
+                const data = await res.json();
+                renderizarProdutos(data);
+            } catch (e) {
+                document.getElementById('catalogo-info').textContent = 'Erro ao carregar produtos. Certifique-se de que a API está rodando.';
+            }
+        }
+
+        function renderizarProdutos(data) {
+            const info = document.getElementById('catalogo-info');
+            const grid = document.getElementById('produtos-grid');
+            const paginacao = document.getElementById('catalogo-paginacao');
+
+            info.textContent = `${data.total.toLocaleString('pt-BR')} produtos encontrados (página ${data.pagina} de ${data.total_paginas})`;
+
+            if (data.produtos.length === 0) {
+                grid.innerHTML = '<div style="color:#999;padding:40px;text-align:center;grid-column:1/-1;">Nenhum produto encontrado.</div>';
+                paginacao.innerHTML = '';
+                return;
+            }
+
+            grid.innerHTML = data.produtos.map(p => {
+                const preco = p.preco_min > 0 ? `R$ ${p.preco_min.toFixed(2).replace('.', ',')}` : 'Sob consulta';
+                const img = p.imagem_principal
+                    ? `<img src="${p.imagem_principal}" alt="${p.titulo}" loading="lazy" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 1 1%22><rect fill=%22%23EEE%22/></svg>'">`
+                    : `<div style="width:100%;height:170px;background:#F4F4F6;display:flex;align-items:center;justify-content:center;color:#CCC;font-size:40px;">📦</div>`;
+                return `
+                <div class="produto-card" onclick="abrirProduto('${p.handle}')">
+                    ${img}
+                    <div class="produto-card-body">
+                        <div class="produto-card-titulo">${p.titulo}</div>
+                        <div class="produto-card-preco">${preco}</div>
+                        <div class="produto-card-tipo">${p.tipo || ''}</div>
+                        <button class="produto-card-btn" onclick="event.stopPropagation();abrirProduto('${p.handle}')">Calcular Preço</button>
+                    </div>
+                </div>`;
+            }).join('');
+
+            // Paginação
+            const pg = data.pagina;
+            const total_pgs = data.total_paginas;
+            let pags = [];
+            if (pg > 1) pags.push(`<button class="pag-btn" onclick="buscarProdutos(${pg - 1})">‹ Anterior</button>`);
+            const start = Math.max(1, pg - 2);
+            const end = Math.min(total_pgs, pg + 2);
+            if (start > 1) pags.push(`<button class="pag-btn" onclick="buscarProdutos(1)">1</button>${start > 2 ? '<span style="padding:7px">…</span>' : ''}`);
+            for (let i = start; i <= end; i++) {
+                pags.push(`<button class="pag-btn ${i === pg ? 'active' : ''}" onclick="buscarProdutos(${i})">${i}</button>`);
+            }
+            if (end < total_pgs) pags.push(`${end < total_pgs - 1 ? '<span style="padding:7px">…</span>' : ''}<button class="pag-btn" onclick="buscarProdutos(${total_pgs})">${total_pgs}</button>`);
+            if (pg < total_pgs) pags.push(`<button class="pag-btn" onclick="buscarProdutos(${pg + 1})">Próxima ›</button>`);
+            paginacao.innerHTML = pags.join('');
+        }
+
+        async function carregarTipos() {
+            try {
+                const res = await fetch('/api/tipos');
+                const data = await res.json();
+                const sel = document.getElementById('catalogo-tipo');
+                data.tipos.forEach(t => {
+                    const opt = document.createElement('option');
+                    opt.value = t.nome;
+                    opt.textContent = `${t.nome} (${t.quantidade})`;
+                    sel.appendChild(opt);
+                });
+            } catch (e) {}
+        }
+
+        async function carregarEstatisticas() {
+            try {
+                const res = await fetch('/api/catalogo');
+                const data = await res.json();
+                document.getElementById('stat-total-produtos').textContent = data.total_produtos.toLocaleString('pt-BR');
+                document.getElementById('catalogo-stats').style.display = 'grid';
+            } catch (e) {}
+
+            try {
+                const res2 = await fetch('/api/tipos');
+                const d2 = await res2.json();
+                document.getElementById('stat-tipos').textContent = d2.tipos.length;
+            } catch (e) {}
+        }
+
+        async function abrirProduto(handle) {
+            try {
+                const res = await fetch(`/api/produtos/${handle}`);
+                const p = await res.json();
+                catalogoState.produto = p;
+
+                document.getElementById('modal-prod-titulo').textContent = p.titulo;
+                document.getElementById('modal-prod-preco').textContent = p.preco_min > 0
+                    ? `Custo: R$ ${p.preco_min.toFixed(2).replace('.', ',')} / un`
+                    : 'Preço sob consulta';
+                document.getElementById('modal-prod-url').href = p.url;
+
+                const img = document.getElementById('modal-prod-img');
+                if (p.imagem_principal) {
+                    img.src = p.imagem_principal;
+                    img.style.display = 'block';
+                } else {
+                    img.style.display = 'none';
+                }
+
+                const tagsEl = document.getElementById('modal-prod-tags');
+                const tags = (p.tags || []).slice(0, 6);
+                tagsEl.innerHTML = tags.map(t => `<span class="tag-chip">${t}</span>`).join('');
+
+                document.getElementById('modal-resultado').innerHTML = '';
+                document.getElementById('modalProduto').classList.add('active');
+            } catch (e) {
+                alert('Erro ao carregar produto.');
+            }
+        }
+
+        function fecharModalProduto() {
+            document.getElementById('modalProduto').classList.remove('active');
+        }
+
+        async function calcularProdutoModal(estrategia) {
+            const p = catalogoState.produto;
+            if (!p) return;
+            const quantidade = parseInt(document.getElementById('modal-qtd').value);
+            const tecnica = document.getElementById('modal-tecnica').value;
+
+            try {
+                const res = await fetch('/api/calcular-produto', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ handle: p.handle, quantidade, personalizacao: tecnica, estrategia })
+                });
+                const data = await res.json();
+
+                if (!data.sucesso) {
+                    document.getElementById('modal-resultado').innerHTML = `<div style="color:red;padding:10px;background:#FFF0F0;border-radius:4px;">${data.erro}${data.quantidade_minima ? ` — mínimo: ${data.quantidade_minima} un` : ''}</div>`;
+                    return;
+                }
+                const c = data.calculo;
+                const cor = estrategia === 'TETO' ? '#27AE60' : estrategia === 'PISO' ? '#E67E22' : '#5D2E91';
+                document.getElementById('modal-resultado').innerHTML = `
+                    <div class="result-box" style="border-left-color:${cor};">
+                        <div class="result-row"><span class="result-label">Estratégia</span><span style="font-weight:700;color:${cor};">${estrategia}</span></div>
+                        <div class="result-row"><span class="result-label">Quantidade</span><span>${quantidade} un</span></div>
+                        <div class="result-row"><span class="result-label">Preço unitário</span><span class="result-value">R$ ${c.totalPrice.toFixed(2).replace('.',',')}</span></div>
+                        <div class="result-row"><span class="result-label">Personalização</span><span>${tecnica}</span></div>
+                        <div class="result-row"><span class="result-label">Margem</span><span>${c.margin}%</span></div>
+                        <div class="result-row" style="border-top:1px solid rgba(93,46,145,0.2);padding-top:10px;margin-top:8px;">
+                            <span class="result-label"><strong>TOTAL DO PEDIDO</strong></span>
+                            <span class="result-value"><strong>R$ ${c.totalBudget.toFixed(2).replace('.',',')}</strong></span>
+                        </div>
+                        <button class="btn btn-secondary" style="width:100%;margin-top:12px;" onclick="copiarWhatsApp()">📱 Copiar msg WhatsApp</button>
+                    </div>`;
+                catalogoState.whatsapp = data.orcamento_whatsapp;
+            } catch (e) {
+                document.getElementById('modal-resultado').innerHTML = '<div style="color:red;">Erro ao calcular. Verifique se a API está rodando.</div>';
+            }
+        }
+
+        function copiarWhatsApp() {
+            if (catalogoState.whatsapp) {
+                navigator.clipboard.writeText(catalogoState.whatsapp).then(() => alert('Mensagem copiada!'));
+            }
+        }
+
         // Inicializar
         document.addEventListener('DOMContentLoaded', () => {
             renderizarAPIs();
         });
 
-        // Fechar modal ao clicar fora
         document.getElementById('modalNovaAPI').addEventListener('click', (e) => {
-            if (e.target.id === 'modalNovaAPI') {
-                closeModalNovaAPI();
-            }
+            if (e.target.id === 'modalNovaAPI') closeModalNovaAPI();
+        });
+
+        document.getElementById('modalProduto').addEventListener('click', (e) => {
+            if (e.target.id === 'modalProduto') fecharModalProduto();
         });
     </script>
 </body>
