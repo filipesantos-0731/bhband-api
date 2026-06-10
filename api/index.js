@@ -1,19 +1,15 @@
+import 'dotenv/config';
 import express from 'express';
-import axios from 'axios';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { readFileSync, existsSync } from 'fs';
+import { supabase } from './supabase.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
 
 // ========== CATÁLOGO DE PRODUTOS ==========
-let CATALOG = { total: 0, atualizado_em: '', produtos: [] };
-const catalogPath = join(__dirname, '..', 'products.json');
-if (existsSync(catalogPath)) {
-  CATALOG = JSON.parse(readFileSync(catalogPath, 'utf-8'));
-  console.log(`📦 Catálogo carregado: ${CATALOG.total} produtos`);
-}
+// Os produtos agora ficam no Supabase (tabela `produtos`).
+// Use `node scripts/sync-shopify.js` para popular/atualizar o catálogo.
 
 // Middleware
 app.use(express.json());
@@ -305,99 +301,108 @@ Personalização: ${technique}
 Vamos seguir com o seu pedido e garantir essa condição especial?`;
 }
 
-// ========== ENDPOINTS DE PRODUTOS ==========
+// ========== ENDPOINTS DE PRODUTOS (Supabase) ==========
 
-// Listar produtos com paginação e filtros
-app.get('/api/produtos', (req, res) => {
-  const {
-    pagina = 1,
-    limite = 50,
-    busca = '',
-    tipo = '',
-    tags = '',
-    preco_min = 0,
-    preco_max = Infinity,
-    ordenar = 'titulo',
-    com_imagem = 'true'
-  } = req.query;
+// Listar produtos com paginação e filtros (consulta direto no Supabase)
+app.get('/api/produtos', async (req, res) => {
+  try {
+    const {
+      pagina = 1,
+      limite = 50,
+      busca = '',
+      tipo = '',
+      tags = '',
+      preco_min = '',
+      preco_max = '',
+      ordenar = 'titulo',
+      com_imagem = 'true'
+    } = req.query;
 
-  let produtos = CATALOG.produtos;
+    const pg = Math.max(parseInt(pagina) || 1, 1);
+    const lim = Math.min(parseInt(limite) || 50, 250);
+    const inicio = (pg - 1) * lim;
 
-  if (com_imagem !== 'false') {
-    produtos = produtos.filter(p => p.imagem_principal);
+    let query = supabase.from('produtos').select('*', { count: 'exact' });
+
+    if (com_imagem !== 'false') {
+      query = query.not('imagem_principal', 'is', null);
+    }
+
+    if (busca) {
+      // Busca case-insensitive por título, tipo ou fornecedor
+      const q = busca.replace(/[%,]/g, ' ').trim();
+      query = query.or(`titulo.ilike.%${q}%,tipo.ilike.%${q}%,fornecedor.ilike.%${q}%`);
+    }
+
+    if (tipo) {
+      query = query.ilike('tipo', tipo);
+    }
+
+    if (tags) {
+      const tagList = tags.split(',').map(t => t.trim()).filter(Boolean);
+      if (tagList.length) query = query.overlaps('tags', tagList);
+    }
+
+    const pMin = parseFloat(preco_min);
+    const pMax = parseFloat(preco_max);
+    if (!isNaN(pMin)) query = query.gte('preco_min', pMin);
+    if (!isNaN(pMax)) query = query.lte('preco_min', pMax);
+
+    if (ordenar === 'preco_asc') query = query.order('preco_min', { ascending: true });
+    else if (ordenar === 'preco_desc') query = query.order('preco_min', { ascending: false });
+    else query = query.order('titulo', { ascending: true });
+
+    query = query.range(inicio, inicio + lim - 1);
+
+    const { data, count, error } = await query;
+    if (error) throw error;
+
+    res.json({
+      total: count || 0,
+      pagina: pg,
+      limite: lim,
+      total_paginas: Math.ceil((count || 0) / lim),
+      produtos: data || []
+    });
+  } catch (erro) {
+    res.status(500).json({ erro: erro.message });
   }
-
-  if (busca) {
-    const q = busca.toLowerCase();
-    produtos = produtos.filter(p =>
-      p.titulo.toLowerCase().includes(q) ||
-      p.tipo.toLowerCase().includes(q) ||
-      (p.tags && p.tags.some(t => t.toLowerCase().includes(q)))
-    );
-  }
-
-  if (tipo) {
-    produtos = produtos.filter(p => p.tipo.toLowerCase() === tipo.toLowerCase());
-  }
-
-  if (tags) {
-    const tagList = tags.split(',').map(t => t.trim().toLowerCase());
-    produtos = produtos.filter(p =>
-      p.tags && tagList.some(tag => p.tags.some(t => t.toLowerCase().includes(tag)))
-    );
-  }
-
-  const pMin = parseFloat(preco_min) || 0;
-  const pMax = parseFloat(preco_max) || Infinity;
-  if (pMin > 0 || pMax < Infinity) {
-    produtos = produtos.filter(p => p.preco_min >= pMin && p.preco_min <= pMax);
-  }
-
-  if (ordenar === 'preco_asc') produtos.sort((a, b) => a.preco_min - b.preco_min);
-  else if (ordenar === 'preco_desc') produtos.sort((a, b) => b.preco_min - a.preco_min);
-  else produtos.sort((a, b) => a.titulo.localeCompare(b.titulo));
-
-  const total = produtos.length;
-  const pg = parseInt(pagina);
-  const lim = Math.min(parseInt(limite), 250);
-  const inicio = (pg - 1) * lim;
-  const pagina_produtos = produtos.slice(inicio, inicio + lim);
-
-  res.json({
-    total,
-    pagina: pg,
-    limite: lim,
-    total_paginas: Math.ceil(total / lim),
-    atualizado_em: CATALOG.atualizado_em,
-    produtos: pagina_produtos
-  });
 });
 
 // Buscar produto por handle
-app.get('/api/produtos/:handle', (req, res) => {
-  const produto = CATALOG.produtos.find(p => p.handle === req.params.handle);
-  if (!produto) {
-    return res.status(404).json({ erro: 'Produto não encontrado', handle: req.params.handle });
+app.get('/api/produtos/:handle', async (req, res) => {
+  try {
+    const { data: produto, error } = await supabase
+      .from('produtos')
+      .select('*')
+      .eq('handle', req.params.handle)
+      .maybeSingle();
+    if (error) throw error;
+    if (!produto) {
+      return res.status(404).json({ erro: 'Produto não encontrado', handle: req.params.handle });
+    }
+    res.json(produto);
+  } catch (erro) {
+    res.status(500).json({ erro: erro.message });
   }
-  res.json(produto);
 });
 
-// Listar tipos de produto
-app.get('/api/tipos', (req, res) => {
-  const tipos = {};
-  CATALOG.produtos.forEach(p => {
-    const tipo = p.tipo || 'Sem categoria';
-    tipos[tipo] = (tipos[tipo] || 0) + 1;
-  });
-  res.json({
-    tipos: Object.entries(tipos)
-      .sort((a, b) => b[1] - a[1])
-      .map(([nome, quantidade]) => ({ nome, quantidade }))
-  });
+// Listar tipos de produto (usa a view tipos_count)
+app.get('/api/tipos', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('tipos_count')
+      .select('*')
+      .order('quantidade', { ascending: false });
+    if (error) throw error;
+    res.json({ tipos: data || [] });
+  } catch (erro) {
+    res.status(500).json({ erro: erro.message });
+  }
 });
 
 // Calcular orçamento para um produto do catálogo
-app.post('/api/calcular-produto', (req, res) => {
+app.post('/api/calcular-produto', async (req, res) => {
   try {
     const { handle, quantidade, personalizacao, estrategia = 'PADRÃO' } = req.body;
 
@@ -405,7 +410,12 @@ app.post('/api/calcular-produto', (req, res) => {
       return res.status(400).json({ erro: 'handle e quantidade são obrigatórios' });
     }
 
-    const produto = CATALOG.produtos.find(p => p.handle === handle);
+    const { data: produto, error } = await supabase
+      .from('produtos')
+      .select('*')
+      .eq('handle', handle)
+      .maybeSingle();
+    if (error) throw error;
     if (!produto) {
       return res.status(404).json({ erro: 'Produto não encontrado' });
     }
@@ -418,7 +428,7 @@ app.post('/api/calcular-produto', (req, res) => {
         erro: 'Valor do pedido abaixo do mínimo',
         custo_total: totalProductCost,
         minimo_permitido: 400,
-        quantidade_minima: Math.ceil(400 / custoUnitario)
+        quantidade_minima: custoUnitario > 0 ? Math.ceil(400 / custoUnitario) : null
       });
     }
 
@@ -443,12 +453,19 @@ app.post('/api/calcular-produto', (req, res) => {
 });
 
 // Info do catálogo
-app.get('/api/catalogo', (req, res) => {
-  res.json({
-    total_produtos: CATALOG.total,
-    atualizado_em: CATALOG.atualizado_em,
-    fonte: CATALOG.fonte
-  });
+app.get('/api/catalogo', async (req, res) => {
+  try {
+    const { count, error } = await supabase
+      .from('produtos')
+      .select('*', { count: 'exact', head: true });
+    if (error) throw error;
+    res.json({
+      total_produtos: count || 0,
+      fonte: process.env.SHOPIFY_STORE || 'https://www.bhband.com.br'
+    });
+  } catch (erro) {
+    res.status(500).json({ erro: erro.message });
+  }
 });
 
 // ========== FALLBACK 404 ==========

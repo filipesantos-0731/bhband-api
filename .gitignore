@@ -11,6 +11,8 @@ build/
 *.swp
 *.swo
 .vercel
-node_modules/
+
+# Dumps locais do catálogo (regeneráveis via `npm run sync`)
 *.csv
 products.json
+produtos.json
