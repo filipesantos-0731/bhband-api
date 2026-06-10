@@ -10,3 +10,7 @@ build/
 .vscode/
 *.swp
 *.swo
+.vercel
+node_modules/
+*.csv
+products.json
