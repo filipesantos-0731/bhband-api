@@ -122,15 +122,15 @@ function mapProduto(p) {
   };
 }
 
-// ---- Baixa produtos ATIVOS via API Admin (cursor pagination) ----
-async function baixarAtivos() {
+// ---- Baixa TODOS os produtos via API Admin (cursor pagination) ----
+// (ativos, arquivados e rascunho — sem filtro de status)
+async function baixarTodos() {
   const todos = [];
   let pageInfo = null;
   for (;;) {
     // page_info não pode coexistir com outros filtros além de limit
     const params = new URLSearchParams({ limit: '250' });
     if (pageInfo) params.set('page_info', pageInfo);
-    else params.set('status', 'active');
 
     const url = `https://${ADMIN_DOMAIN}/admin/api/${API_VERSION}/products.json?${params}`;
 
@@ -139,11 +139,18 @@ async function baixarAtivos() {
       try {
         resp = await axios.get(url, {
           headers: { 'X-Shopify-Access-Token': ADMIN_TOKEN },
-          timeout: 30000
+          timeout: 60000
         });
+        // Às vezes o Shopify devolve 200 com corpo truncado/sem products: trata como transitório
+        if (!resp.data || !Array.isArray(resp.data.products)) {
+          throw new Error('resposta sem array products');
+        }
         break;
       } catch (e) {
-        if (e.response?.status === 429 && tentativa <= 5) {
+        const status = e.response?.status;
+        const transitorio = status === 429 || (status >= 500 && status < 600) || !status; // rede/parse
+        if (transitorio && tentativa <= 6) {
+          process.stdout.write(`\r⏳ Tentando de novo (${tentativa}) após erro transitório...`);
           await sleep(2000 * tentativa);
           continue;
         }
@@ -153,7 +160,7 @@ async function baixarAtivos() {
 
     const lote = resp.data.products || [];
     todos.push(...lote);
-    process.stdout.write(`\r📥 Baixados ${todos.length} produtos ativos...`);
+    process.stdout.write(`\r📥 Baixados ${todos.length} produtos...`);
 
     pageInfo = parseNextPageInfo(resp.headers['link']);
     if (!pageInfo || lote.length === 0) break;
@@ -174,15 +181,47 @@ function parseNextPageInfo(linkHeader) {
 async function gravarNoSupabase(produtos) {
   const { createClient } = await import('@supabase/supabase-js');
   const supabase = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
-  let enviados = 0;
-  for (let i = 0; i < produtos.length; i += 500) {
-    const lote = produtos.slice(i, i + 500);
-    const { error } = await supabase.from('produtos').upsert(lote, { onConflict: 'id' });
+  const LOTE = 100;
+  async function upsert(linhas) {
+    const { error } = await supabase.from('produtos').upsert(linhas, { onConflict: 'id' });
     if (error) throw error;
+  }
+
+  let enviados = 0;
+  for (let i = 0; i < produtos.length; i += LOTE) {
+    const lote = produtos.slice(i, i + LOTE);
+    let ok = false;
+    for (let tentativa = 1; tentativa <= 6 && !ok; tentativa++) {
+      try {
+        await upsert(lote);
+        ok = true;
+      } catch (e) {
+        process.stdout.write(`\r⏳ Lote ${Math.floor(i / LOTE) + 1}: retry ${tentativa} (${e.message})...`);
+        await sleep(1500 * tentativa);
+      }
+    }
+    // Fallback: se o lote inteiro falhou, tenta linha-a-linha (isola payload problemático)
+    if (!ok) {
+      for (const linha of lote) {
+        for (let t = 1; ; t++) {
+          try { await upsert([linha]); break; }
+          catch (e) {
+            if (t <= 4) { await sleep(1500 * t); continue; }
+            console.warn(`\n⚠️  Produto ${linha.id} (${linha.handle}) não inserido: ${e.message}`);
+            break;
+          }
+        }
+      }
+    }
     enviados += lote.length;
     process.stdout.write(`\r⬆️  Enviados ${enviados}/${produtos.length} ao Supabase...`);
   }
   process.stdout.write('\n');
+
+  // Remove do banco quaisquer produtos sem imagem (de execuções anteriores)
+  const { error: errDel } = await supabase.from('produtos').delete().is('imagem_principal', null);
+  if (errDel) console.warn('⚠️  Falha ao remover produtos sem imagem:', errDel.message);
+  else console.log('🧹 Produtos sem imagem removidos do banco.');
 }
 
 function gravarEmArquivo(produtos) {
@@ -197,16 +236,19 @@ function gravarEmArquivo(produtos) {
 }
 
 async function main() {
-  console.log(`🔐 API Admin: ${ADMIN_DOMAIN} (somente produtos ativos)`);
+  console.log(`🔐 API Admin: ${ADMIN_DOMAIN} (todos os produtos: ativos, arquivados e rascunho)`);
   ADMIN_TOKEN = await obterToken();
 
-  const brutos = await baixarAtivos();
-  // Garantia extra: filtra status active mesmo que a API devolva outros
-  const ativos = brutos.filter(p => (p.status || 'active') === 'active');
-  const produtos = ativos.map(mapProduto);
+  const brutos = await baixarTodos();
+  const mapeados = brutos.map(mapProduto);
 
+  // Regra: produto sem imagem não entra no catálogo
+  const produtos = mapeados.filter(p => p.imagem_principal);
+  const semImagem = mapeados.length - produtos.length;
+
+  const porStatus = produtos.reduce((acc, p) => { acc[p.status || 'sem_status'] = (acc[p.status || 'sem_status'] || 0) + 1; return acc; }, {});
   const totalVariantes = produtos.reduce((s, p) => s + p.variantes.length, 0);
-  console.log(`✅ ${produtos.length} produtos ativos, ${totalVariantes} variantes mapeadas.`);
+  console.log(`✅ ${produtos.length} produtos com imagem (${JSON.stringify(porStatus)}), ${totalVariantes} variantes. Ignorados sem imagem: ${semImagem}.`);
 
   if (SUPABASE_URL && SERVICE_KEY) {
     await gravarNoSupabase(produtos);
