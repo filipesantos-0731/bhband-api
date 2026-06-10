@@ -63,71 +63,107 @@ let ADMIN_TOKEN = null; // preenchido em main()
 // Nomes de opção tratados como "cor"
 const COLOR_OPTION_NAMES = ['cor', 'cores', 'color', 'colour'];
 
-// ---- Mapeia um produto Admin para o formato da tabela `produtos` ----
-function mapProduto(p) {
-  // Índice imagem por id -> src (para associar à variante)
+// slug p/ compor handles por variante (sem acento, minúsculo, hifenizado)
+function slug(s) {
+  return (s || '')
+    .toString()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '') // remove acentos
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '');
+}
+
+// Controla unicidade global dos handles (a coluna handle tem UNIQUE)
+const handlesUsados = new Set();
+function handleUnico(base, varianteId) {
+  let h = base || `produto-${varianteId}`;
+  if (handlesUsados.has(h)) h = `${base}-${varianteId}`;
+  handlesUsados.add(h);
+  return h;
+}
+
+// ---- Mapeia um produto Admin em UMA LINHA POR VARIANTE ----
+// Cada variante vira um "produto" próprio, com o nome da variante junto do
+// nome original (ex.: "Caneca Térmica - Azul"). Produtos sem variação real
+// (variante "Default Title") permanecem como 1 linha com o nome original.
+function mapVariantes(p) {
   const imagemPorId = {};
   for (const img of p.images || []) imagemPorId[img.id] = img.src;
 
-  const variantes = (p.variants || []).map(v => ({
-    id: v.id,
-    titulo: v.title,
-    sku: v.sku || null,
-    preco: parseFloat(v.price) || 0,
-    preco_comparacao: v.compare_at_price ? parseFloat(v.compare_at_price) : null,
-    opcao1: v.option1 || null,
-    opcao2: v.option2 || null,
-    opcao3: v.option3 || null,
-    estoque: typeof v.inventory_quantity === 'number' ? v.inventory_quantity : null,
-    imagem: v.image_id ? (imagemPorId[v.image_id] || null) : null
-  }));
-
-  const precos = variantes.map(v => v.preco).filter(n => n > 0);
-  const preco_min = precos.length ? Math.min(...precos) : 0;
-  const preco_max = precos.length ? Math.max(...precos) : 0;
-
-  const opcoes = (p.options || []).map(o => ({
-    nome: o.name,
-    valores: o.values || []
-  }));
-
-  // Extrai as cores da opção cujo nome bate com COLOR_OPTION_NAMES
-  const opcaoCor = opcoes.find(o => COLOR_OPTION_NAMES.includes((o.nome || '').toLowerCase()));
-  const cores = opcaoCor ? opcaoCor.valores : [];
-
   const imagens = (p.images || []).map(img => ({ src: img.src, alt: img.alt || null }));
+  const imagemProduto = p.image?.src || imagens[0]?.src || null;
+
+  const opcoes = (p.options || []).map(o => ({ nome: o.name, valores: o.values || [] }));
+  // posição (1-based) da opção de cor -> mapeia para v.option1/2/3
+  const posCor = (p.options || []).findIndex(o => COLOR_OPTION_NAMES.includes((o.name || '').toLowerCase()));
 
   const tags = Array.isArray(p.tags)
     ? p.tags
     : (p.tags ? String(p.tags).split(',').map(t => t.trim()).filter(Boolean) : []);
 
-  return {
-    id: p.id,
-    handle: p.handle,
-    titulo: p.title,
+  const base = {
     tipo: p.product_type || null,
     fornecedor: p.vendor || null,
     status: p.status || null,
     tags,
     descricao: p.body_html || null,
-    imagem_principal: p.image?.src || imagens[0]?.src || null,
     imagens,
     opcoes,
-    cores,
-    variantes,
-    preco_min,
-    preco_max,
-    url: `${STORE}/products/${p.handle}`,
     atualizado_em: new Date().toISOString()
   };
+
+  const variantes = p.variants || [];
+  const unica = variantes.length <= 1; // sem variação real → não anexa sufixo
+
+  const linhas = [];
+  for (const v of variantes) {
+    const ehDefault = unica || v.title === 'Default Title';
+    const imagemVariante = v.image_id ? (imagemPorId[v.image_id] || null) : null;
+    const imagem = imagemVariante || imagemProduto;
+    if (!imagem) continue; // regra: sem imagem não entra
+
+    const preco = parseFloat(v.price) || 0;
+    const cor = posCor >= 0 ? [v.option1, v.option2, v.option3][posCor] : null;
+
+    const titulo = ehDefault ? p.title : `${p.title} - ${v.title}`;
+    const handleBase = ehDefault ? p.handle : `${p.handle}-${slug(v.title)}`;
+
+    linhas.push({
+      id: v.id, // id da VARIANTE (PK)
+      handle: handleUnico(handleBase, v.id),
+      titulo,
+      ...base,
+      imagem_principal: imagem,
+      cores: cor ? [cor] : [],
+      variantes: [{
+        id: v.id,
+        titulo: v.title,
+        sku: v.sku || null,
+        preco,
+        preco_comparacao: v.compare_at_price ? parseFloat(v.compare_at_price) : null,
+        opcao1: v.option1 || null,
+        opcao2: v.option2 || null,
+        opcao3: v.option3 || null,
+        estoque: typeof v.inventory_quantity === 'number' ? v.inventory_quantity : null,
+        imagem: imagemVariante
+      }],
+      preco_min: preco,
+      preco_max: preco,
+      url: `${STORE}/products/${p.handle}${ehDefault ? '' : `?variant=${v.id}`}`
+    });
+  }
+  return linhas;
 }
 
 // ---- Baixa TODOS os produtos via API Admin (cursor pagination) ----
 // (ativos, arquivados e rascunho — sem filtro de status)
 async function baixarTodos() {
   const todos = [];
+  const maxPaginas = parseInt(process.env.LIMIT_PAGES) || Infinity; // p/ dry-run
+  let pagina = 0;
   let pageInfo = null;
   for (;;) {
+    if (++pagina > maxPaginas) break;
     // page_info não pode coexistir com outros filtros além de limit
     const params = new URLSearchParams({ limit: '250' });
     if (pageInfo) params.set('page_info', pageInfo);
@@ -187,6 +223,12 @@ async function gravarNoSupabase(produtos) {
     if (error) throw error;
   }
 
+  // Como a PK passou a ser o id da VARIANTE, limpamos as linhas antigas
+  // (que eram por id de PRODUTO) antes de reinserir.
+  const { error: errClear } = await supabase.from('produtos').delete().gt('id', 0);
+  if (errClear) throw errClear;
+  console.log('🧹 Tabela produtos limpa (reescrita por variante).');
+
   let enviados = 0;
   for (let i = 0; i < produtos.length; i += LOTE) {
     const lote = produtos.slice(i, i + LOTE);
@@ -217,11 +259,6 @@ async function gravarNoSupabase(produtos) {
     process.stdout.write(`\r⬆️  Enviados ${enviados}/${produtos.length} ao Supabase...`);
   }
   process.stdout.write('\n');
-
-  // Remove do banco quaisquer produtos sem imagem (de execuções anteriores)
-  const { error: errDel } = await supabase.from('produtos').delete().is('imagem_principal', null);
-  if (errDel) console.warn('⚠️  Falha ao remover produtos sem imagem:', errDel.message);
-  else console.log('🧹 Produtos sem imagem removidos do banco.');
 }
 
 function gravarEmArquivo(produtos) {
@@ -240,15 +277,11 @@ async function main() {
   ADMIN_TOKEN = await obterToken();
 
   const brutos = await baixarTodos();
-  const mapeados = brutos.map(mapProduto);
-
-  // Regra: produto sem imagem não entra no catálogo
-  const produtos = mapeados.filter(p => p.imagem_principal);
-  const semImagem = mapeados.length - produtos.length;
+  // Cada variante vira uma linha (com nome da variante no título); sem imagem é ignorado
+  const produtos = brutos.flatMap(mapVariantes);
 
   const porStatus = produtos.reduce((acc, p) => { acc[p.status || 'sem_status'] = (acc[p.status || 'sem_status'] || 0) + 1; return acc; }, {});
-  const totalVariantes = produtos.reduce((s, p) => s + p.variantes.length, 0);
-  console.log(`✅ ${produtos.length} produtos com imagem (${JSON.stringify(porStatus)}), ${totalVariantes} variantes. Ignorados sem imagem: ${semImagem}.`);
+  console.log(`✅ ${produtos.length} variantes-produto com imagem (${JSON.stringify(porStatus)}), de ${brutos.length} produtos do Shopify.`);
 
   if (SUPABASE_URL && SERVICE_KEY) {
     await gravarNoSupabase(produtos);
