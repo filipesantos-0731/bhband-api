@@ -411,40 +411,54 @@ app.get('/api/produtos/buscar', async (req, res) => {
       'em','no','na','nos','nas','ao','aos','um','uma','uns','umas','os','as','que','ou','uns'
     ]);
 
-    let query = supabase
-      .from('produtos')
-      .select('id,titulo,descricao,preco_min,imagem_principal,cores,tipo,status,url');
+    const idNum = String(id).trim() && /^\d+$/.test(String(id).trim()) ? Number(String(id).trim()) : null;
+    const termos = sanit(q)
+      .split(/\s+/)
+      .filter((t) => t.length >= 2 && !STOPWORDS.has(deburr(t.toLowerCase())));
+    const pMin = parseFloat(preco_min);
+    const pMax = parseFloat(preco_max);
 
-    if (String(id).trim() && /^\d+$/.test(String(id).trim())) {
-      // Identificador específico: match exato
-      query = query.eq('id', Number(String(id).trim()));
-    } else {
-      // Busca textual parcial: cada palavra precisa casar (AND de OR-por-campo)
-      const termos = sanit(q)
-        .split(/\s+/)
-        .filter((t) => t.length >= 2 && !STOPWORDS.has(deburr(t.toLowerCase())));
-      for (const t of termos) {
-        // cada palavra precisa casar em título OU categoria (AND entre palavras)
-        query = query.or(`titulo.ilike.%${t}%,tipo.ilike.%${t}%`);
+    // Monta a query. `modoBusca='busca'` usa a coluna gerada acento-insensível
+    // (minúscula/sem acento); `modoBusca='titulo'` é o fallback se a coluna
+    // `busca` ainda não existir no banco (antes de rodar supabase/busca-acento.sql).
+    function montar(modoBusca) {
+      const acentoOk = modoBusca === 'busca';
+      const campo = acentoOk ? 'busca' : 'titulo';
+      const norm = (s) => acentoOk ? deburr(sanit(s).toLowerCase()) : sanit(s);
+
+      let qy = supabase
+        .from('produtos')
+        .select('id,titulo,descricao,preco_min,imagem_principal,cores,tipo,status,url');
+
+      if (idNum !== null) {
+        qy = qy.eq('id', idNum);
+      } else {
+        for (const t of termos) {
+          // cada palavra precisa casar (AND entre palavras)
+          qy = acentoOk
+            ? qy.ilike('busca', `%${deburr(t.toLowerCase())}%`)
+            : qy.or(`titulo.ilike.%${t}%,tipo.ilike.%${t}%`);
+        }
+        if (cor) qy = qy.ilike(campo, `%${norm(cor)}%`);
+        if (categoria) qy = acentoOk ? qy.ilike('busca', `%${norm(categoria)}%`) : qy.ilike('tipo', `%${norm(categoria)}%`);
+        if (sku) {
+          const s = sanit(sku);
+          qy = qy.or(`handle.ilike.%${s}%,titulo.ilike.%${s}%`);
+        }
+        if (!isNaN(pMin)) qy = qy.gte('preco_min', pMin);
+        if (!isNaN(pMax)) qy = qy.lte('preco_min', pMax);
       }
-      if (cor) query = query.ilike('titulo', `%${sanit(cor)}%`);
-      if (categoria) query = query.ilike('tipo', `%${sanit(categoria)}%`);
-      if (sku) {
-        const s = sanit(sku);
-        query = query.or(`handle.ilike.%${s}%,titulo.ilike.%${s}%`);
-      }
-      const pMin = parseFloat(preco_min);
-      const pMax = parseFloat(preco_max);
-      if (!isNaN(pMin)) query = query.gte('preco_min', pMin);
-      if (!isNaN(pMax)) query = query.lte('preco_min', pMax);
+      return qy
+        .not('imagem_principal', 'is', null)
+        .order('preco_min', { ascending: true })
+        .limit(lim);
     }
 
-    query = query
-      .not('imagem_principal', 'is', null)
-      .order('preco_min', { ascending: true })
-      .limit(lim);
-
-    const { data, error } = await query;
+    let { data, error } = await montar('busca');
+    // Coluna `busca` ainda não criada → cai no modo título (sensível a acento)
+    if (error && /busca/.test(error.message || '')) {
+      ({ data, error } = await montar('titulo'));
+    }
     if (error) throw error;
 
     const stripHtml = (h) => (h || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
