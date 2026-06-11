@@ -392,6 +392,24 @@ app.get('/api/produtos/buscar', async (req, res) => {
     const lim = Math.min(Math.max(parseInt(limite) || 5, 1), 25);
     // remove caracteres que quebram a sintaxe do filtro .or() do PostgREST
     const sanit = (s) => String(s).replace(/[%,()*]/g, ' ').trim();
+    // remove acentos para comparar com a lista de palavras ignoradas
+    const deburr = (s) => s.normalize('NFD').replace(/[̀-ͯ]/g, '');
+    // Palavras de intenção/preço e stopwords PT que NÃO aparecem no nome do
+    // produto (se entrarem no termo, zerariam a busca por exigir todas).
+    const STOPWORDS = new Set([
+      // preço / intenção
+      'barato','barata','baratos','baratas','caro','cara','caros','caras','economico','economica',
+      'preco','precos','valor','valores','custo','custos','conta','promocao','promocoes','promocional',
+      'desconto','descontos','oferta','ofertas','barganha','acessivel','acessivel',
+      // genéricos / fillers
+      'mais','menos','bem','bom','boa','bons','boas','melhor','melhores','otimo','otima','qualidade',
+      'produto','produtos','item','itens','coisa','coisas','algo','algum','alguma','alguns','algumas',
+      'opcao','opcoes','tipo','tipos','modelo','modelos','ideia','ideias','sugestao','sugestoes',
+      // verbos/pedido
+      'quero','queria','gostaria','preciso','quer','ver','mostra','mostrar','mostre','busca','buscar',
+      'procuro','procurar','tem','ter','me','pra','para','por','com','sem','de','da','do','das','dos',
+      'em','no','na','nos','nas','ao','aos','um','uma','uns','umas','os','as','que','ou','uns'
+    ]);
 
     let query = supabase
       .from('produtos')
@@ -402,7 +420,9 @@ app.get('/api/produtos/buscar', async (req, res) => {
       query = query.eq('id', Number(String(id).trim()));
     } else {
       // Busca textual parcial: cada palavra precisa casar (AND de OR-por-campo)
-      const termos = sanit(q).split(/\s+/).filter(Boolean);
+      const termos = sanit(q)
+        .split(/\s+/)
+        .filter((t) => t.length >= 2 && !STOPWORDS.has(deburr(t.toLowerCase())));
       for (const t of termos) {
         // cada palavra precisa casar em título OU categoria (AND entre palavras)
         query = query.or(`titulo.ilike.%${t}%,tipo.ilike.%${t}%`);
