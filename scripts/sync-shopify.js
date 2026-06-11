@@ -159,8 +159,7 @@ function mapVariantes(p) {
   return linhas;
 }
 
-// ---- Baixa TODOS os produtos via API Admin (cursor pagination) ----
-// (ativos, arquivados e rascunho — sem filtro de status)
+// ---- Baixa apenas os produtos ATIVOS via API Admin (cursor pagination) ----
 async function baixarTodos() {
   const todos = [];
   const maxPaginas = parseInt(process.env.LIMIT_PAGES) || Infinity; // p/ dry-run
@@ -168,9 +167,10 @@ async function baixarTodos() {
   let pageInfo = null;
   for (;;) {
     if (++pagina > maxPaginas) break;
-    // page_info não pode coexistir com outros filtros além de limit
+    // page_info não pode coexistir com outros filtros; status só na 1ª página
     const params = new URLSearchParams({ limit: '250' });
     if (pageInfo) params.set('page_info', pageInfo);
+    else params.set('status', 'active');
 
     const url = `https://${ADMIN_DOMAIN}/admin/api/${API_VERSION}/products.json?${params}`;
 
@@ -325,7 +325,7 @@ function dedupReais(linhas) {
 }
 
 async function main() {
-  console.log(`🔐 API Admin: ${ADMIN_DOMAIN} (todos os produtos: ativos, arquivados e rascunho)`);
+  console.log(`🔐 API Admin: ${ADMIN_DOMAIN} (somente produtos ATIVOS)`);
   ADMIN_TOKEN = await obterToken();
 
   const brutos = await baixarTodos();
