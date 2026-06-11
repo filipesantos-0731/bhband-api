@@ -60,6 +60,10 @@ async function obterToken() {
 
 let ADMIN_TOKEN = null; // preenchido em main()
 
+// Timestamp único desta execução: marca as linhas gravadas agora, para
+// depois apagar em lote as que sobraram de execuções anteriores (obsoletas).
+const SYNC_TS = new Date().toISOString();
+
 // Nomes de opção tratados como "cor"
 const COLOR_OPTION_NAMES = ['cor', 'cores', 'color', 'colour'];
 
@@ -109,7 +113,7 @@ function mapVariantes(p) {
     descricao: p.body_html || null,
     imagens,
     opcoes,
-    atualizado_em: new Date().toISOString()
+    atualizado_em: SYNC_TS
   };
 
   const variantes = p.variants || [];
@@ -223,12 +227,6 @@ async function gravarNoSupabase(produtos) {
     if (error) throw error;
   }
 
-  // Como a PK passou a ser o id da VARIANTE, limpamos as linhas antigas
-  // (que eram por id de PRODUTO) antes de reinserir.
-  const { error: errClear } = await supabase.from('produtos').delete().gt('id', 0);
-  if (errClear) throw errClear;
-  console.log('🧹 Tabela produtos limpa (reescrita por variante).');
-
   let enviados = 0;
   for (let i = 0; i < produtos.length; i += LOTE) {
     const lote = produtos.slice(i, i + LOTE);
@@ -259,6 +257,29 @@ async function gravarNoSupabase(produtos) {
     process.stdout.write(`\r⬆️  Enviados ${enviados}/${produtos.length} ao Supabase...`);
   }
   process.stdout.write('\n');
+
+  // Remove linhas obsoletas (de execuções anteriores) em lotes pequenos,
+  // evitando o "statement timeout" de um DELETE gigante.
+  let removidos = 0;
+  for (;;) {
+    const { data: obsoletos, error: errSel } = await supabase
+      .from('produtos').select('id').neq('atualizado_em', SYNC_TS).limit(1000);
+    if (errSel) throw errSel;
+    if (!obsoletos || obsoletos.length === 0) break;
+    const ids = obsoletos.map(r => r.id);
+    for (let i = 0; i < ids.length; i += 200) {
+      const chunk = ids.slice(i, i + 200);
+      for (let t = 1; ; t++) {
+        const { error } = await supabase.from('produtos').delete().in('id', chunk);
+        if (!error) break;
+        if (t > 5) throw error;
+        await sleep(1500 * t);
+      }
+    }
+    removidos += ids.length;
+    process.stdout.write(`\r🧹 Removidas ${removidos} linhas obsoletas...`);
+  }
+  if (removidos) process.stdout.write('\n');
 }
 
 function gravarEmArquivo(produtos) {
@@ -272,16 +293,37 @@ function gravarEmArquivo(produtos) {
   console.log(`💾 Salvo em produtos.json (${produtos.length} produtos) — Supabase não configurado.`);
 }
 
+// Remove linhas com título EXATAMENTE igual, mantendo a melhor:
+// 1) prioriza status 'active'; 2) empate -> menor id (determinístico)
+function dedupPorTitulo(linhas) {
+  const melhorPorTitulo = new Map();
+  for (const l of linhas) {
+    const atual = melhorPorTitulo.get(l.titulo);
+    if (!atual) { melhorPorTitulo.set(l.titulo, l); continue; }
+    const lAtiva = l.status === 'active';
+    const aAtiva = atual.status === 'active';
+    let vencedor;
+    if (lAtiva !== aAtiva) vencedor = lAtiva ? l : atual;
+    else vencedor = l.id < atual.id ? l : atual;
+    melhorPorTitulo.set(l.titulo, vencedor);
+  }
+  return [...melhorPorTitulo.values()];
+}
+
 async function main() {
   console.log(`🔐 API Admin: ${ADMIN_DOMAIN} (todos os produtos: ativos, arquivados e rascunho)`);
   ADMIN_TOKEN = await obterToken();
 
   const brutos = await baixarTodos();
   // Cada variante vira uma linha (com nome da variante no título); sem imagem é ignorado
-  const produtos = brutos.flatMap(mapVariantes);
+  const todas = brutos.flatMap(mapVariantes);
+
+  // Remove títulos exatamente iguais, mantendo o ativo (empate: menor id)
+  const produtos = dedupPorTitulo(todas);
+  const removidos = todas.length - produtos.length;
 
   const porStatus = produtos.reduce((acc, p) => { acc[p.status || 'sem_status'] = (acc[p.status || 'sem_status'] || 0) + 1; return acc; }, {});
-  console.log(`✅ ${produtos.length} variantes-produto com imagem (${JSON.stringify(porStatus)}), de ${brutos.length} produtos do Shopify.`);
+  console.log(`✅ ${produtos.length} variantes-produto (${JSON.stringify(porStatus)}), de ${brutos.length} produtos do Shopify. Duplicados por título removidos: ${removidos}.`);
 
   if (SUPABASE_URL && SERVICE_KEY) {
     await gravarNoSupabase(produtos);
