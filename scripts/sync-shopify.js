@@ -188,8 +188,10 @@ async function baixarTodos() {
         break;
       } catch (e) {
         const status = e.response?.status;
-        const transitorio = status === 429 || (status >= 500 && status < 600) || !status; // rede/parse
-        if (transitorio && tentativa <= 6) {
+        // Tenta de novo em qualquer erro menos os de autenticação (401/403).
+        // Inclui 200 com corpo truncado, 429, 5xx, rede/timeout.
+        const transitorio = status !== 401 && status !== 403;
+        if (transitorio && tentativa <= 8) {
           process.stdout.write(`\r⏳ Tentando de novo (${tentativa}) após erro transitório...`);
           await sleep(2000 * tentativa);
           continue;
@@ -293,21 +295,33 @@ function gravarEmArquivo(produtos) {
   console.log(`💾 Salvo em produtos.json (${produtos.length} produtos) — Supabase não configurado.`);
 }
 
-// Remove linhas com título EXATAMENTE igual, mantendo a melhor:
-// 1) prioriza status 'active'; 2) empate -> menor id (determinístico)
-function dedupPorTitulo(linhas) {
-  const melhorPorTitulo = new Map();
+// Chave de duplicata: nome normalizado (ignora maiúsc./minúsc. e espaços).
+// O título de cada linha já inclui a cor (ex.: "... - Azul"), então nome
+// idêntico = mesmo produto + mesma cor. NÃO usamos a imagem na chave porque
+// a loja reaproveita fotos erradas em cópias arquivadas (ex.: a "Transparente"
+// arquivada usa a foto do "Azul"); comparar por imagem causaria mescla errada.
+function chaveDedup(l) {
+  return (l.titulo || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+// Entre duas linhas "iguais", escolhe a melhor:
+// 1) prioriza status 'active'; 2) empate -> mais recente (id maior)
+function melhorLinha(a, b) {
+  const aAtiva = a.status === 'active';
+  const bAtiva = b.status === 'active';
+  if (aAtiva !== bAtiva) return aAtiva ? a : b;
+  return a.id > b.id ? a : b;
+}
+
+// Remove duplicatas reais (mesmo nome + mesma imagem), mantendo a melhor.
+function dedupReais(linhas) {
+  const melhorPorChave = new Map();
   for (const l of linhas) {
-    const atual = melhorPorTitulo.get(l.titulo);
-    if (!atual) { melhorPorTitulo.set(l.titulo, l); continue; }
-    const lAtiva = l.status === 'active';
-    const aAtiva = atual.status === 'active';
-    let vencedor;
-    if (lAtiva !== aAtiva) vencedor = lAtiva ? l : atual;
-    else vencedor = l.id < atual.id ? l : atual;
-    melhorPorTitulo.set(l.titulo, vencedor);
+    const k = chaveDedup(l);
+    const atual = melhorPorChave.get(k);
+    melhorPorChave.set(k, atual ? melhorLinha(atual, l) : l);
   }
-  return [...melhorPorTitulo.values()];
+  return [...melhorPorChave.values()];
 }
 
 async function main() {
@@ -318,18 +332,20 @@ async function main() {
   // Cada variante vira uma linha (com nome da variante no título); sem imagem é ignorado
   const todas = brutos.flatMap(mapVariantes);
 
-  // Remove títulos exatamente iguais, mantendo o ativo (empate: menor id)
-  const produtos = dedupPorTitulo(todas);
+  // Remove duplicatas reais (mesmo nome normalizado + mesma imagem),
+  // mantendo o ativo e mais recente.
+  const produtos = dedupReais(todas);
   const removidos = todas.length - produtos.length;
 
   const porStatus = produtos.reduce((acc, p) => { acc[p.status || 'sem_status'] = (acc[p.status || 'sem_status'] || 0) + 1; return acc; }, {});
-  console.log(`✅ ${produtos.length} variantes-produto (${JSON.stringify(porStatus)}), de ${brutos.length} produtos do Shopify. Duplicados por título removidos: ${removidos}.`);
+  console.log(`✅ ${produtos.length} variantes-produto (${JSON.stringify(porStatus)}), de ${brutos.length} produtos do Shopify. Duplicatas removidas: ${removidos}.`);
 
-  if (SUPABASE_URL && SERVICE_KEY) {
+  if (SUPABASE_URL && SERVICE_KEY && !process.env.DRY_RUN) {
     await gravarNoSupabase(produtos);
     console.log(`🎉 Sincronização concluída no Supabase.`);
   } else {
     gravarEmArquivo(produtos);
+    if (process.env.DRY_RUN) console.log('🧪 DRY_RUN: nada foi gravado no Supabase.');
   }
 }
 
