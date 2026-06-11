@@ -418,46 +418,55 @@ app.get('/api/produtos/buscar', async (req, res) => {
     const pMin = parseFloat(preco_min);
     const pMax = parseFloat(preco_max);
 
-    // Monta a query. `modoBusca='busca'` usa a coluna gerada acento-insensível
-    // (minúscula/sem acento); `modoBusca='titulo'` é o fallback se a coluna
-    // `busca` ainda não existir no banco (antes de rodar supabase/busca-acento.sql).
-    function montar(modoBusca) {
-      const acentoOk = modoBusca === 'busca';
-      const campo = acentoOk ? 'busca' : 'titulo';
-      const norm = (s) => acentoOk ? deburr(sanit(s).toLowerCase()) : sanit(s);
+    // Termos textuais combinados (q + cor + categoria) sem stopwords.
+    // No modo FTS, o stemmer português + unaccent cuidam de plural/gênero/acento.
+    const termosTexto = [...termos];
+    if (cor) termosTexto.push(...sanit(cor).split(/\s+/).filter(Boolean));
+    if (categoria) termosTexto.push(...sanit(categoria).split(/\s+/).filter(Boolean));
 
-      let qy = supabase
+    function base() {
+      return supabase
         .from('produtos')
         .select('id,titulo,descricao,preco_min,imagem_principal,cores,tipo,status,url');
-
-      if (idNum !== null) {
-        qy = qy.eq('id', idNum);
-      } else {
-        for (const t of termos) {
-          // cada palavra precisa casar (AND entre palavras)
-          qy = acentoOk
-            ? qy.ilike('busca', `%${deburr(t.toLowerCase())}%`)
-            : qy.or(`titulo.ilike.%${t}%,tipo.ilike.%${t}%`);
-        }
-        if (cor) qy = qy.ilike(campo, `%${norm(cor)}%`);
-        if (categoria) qy = acentoOk ? qy.ilike('busca', `%${norm(categoria)}%`) : qy.ilike('tipo', `%${norm(categoria)}%`);
-        if (sku) {
-          const s = sanit(sku);
-          qy = qy.or(`handle.ilike.%${s}%,titulo.ilike.%${s}%`);
-        }
-        if (!isNaN(pMin)) qy = qy.gte('preco_min', pMin);
-        if (!isNaN(pMax)) qy = qy.lte('preco_min', pMax);
+    }
+    function filtrosComuns(qy) {
+      if (sku) {
+        const s = sanit(sku);
+        qy = qy.or(`handle.ilike.%${s}%,titulo.ilike.%${s}%`);
       }
+      if (!isNaN(pMin)) qy = qy.gte('preco_min', pMin);
+      if (!isNaN(pMax)) qy = qy.lte('preco_min', pMax);
       return qy
         .not('imagem_principal', 'is', null)
         .order('preco_min', { ascending: true })
         .limit(lim);
     }
 
-    let { data, error } = await montar('busca');
-    // Coluna `busca` ainda não criada → cai no modo título (sensível a acento)
-    if (error && /busca/.test(error.message || '')) {
-      ({ data, error } = await montar('titulo'));
+    // Modo 1 (preferido): full-text português + unaccent (coluna busca_fts).
+    function montarFTS() {
+      let qy = base();
+      if (idNum !== null) qy = qy.eq('id', idNum);
+      else if (termosTexto.length) {
+        qy = qy.textSearch('busca_fts', termosTexto.join(' '), { type: 'websearch', config: 'pt_unaccent' });
+      }
+      return filtrosComuns(qy);
+    }
+    // Modo 2 (fallback, se busca_fts ainda não existir): ilike em título/categoria.
+    function montarTitulo() {
+      let qy = base();
+      if (idNum !== null) qy = qy.eq('id', idNum);
+      else {
+        for (const t of termos) qy = qy.or(`titulo.ilike.%${t}%,tipo.ilike.%${t}%`);
+        if (cor) qy = qy.ilike('titulo', `%${sanit(cor)}%`);
+        if (categoria) qy = qy.ilike('tipo', `%${sanit(categoria)}%`);
+      }
+      return filtrosComuns(qy);
+    }
+
+    let { data, error } = await montarFTS();
+    // busca_fts/config ainda não criados → cai no modo título
+    if (error && /busca_fts|pt_unaccent|text search/i.test(error.message || '')) {
+      ({ data, error } = await montarTitulo());
     }
     if (error) throw error;
 

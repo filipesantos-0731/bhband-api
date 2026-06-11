@@ -1,30 +1,34 @@
 -- ============================================================
--- Busca acento-insensível para /api/produtos/buscar
+-- Busca inteligente para /api/produtos/buscar
+-- Full-text search em português + unaccent: entende plural/gênero
+-- (canecas≈caneca, roxas≈roxo) e ignora acento (ceramica≈cerâmica).
 -- Rode no Supabase: SQL Editor > New query > Run
 -- Não altera dados dos produtos — só adiciona uma coluna derivada (gerada)
 -- que o Postgres preenche e mantém sozinho.
 -- ============================================================
 
--- 1) Extensões
+-- 1) Extensão para remover acentos
 create extension if not exists unaccent;
-create extension if not exists pg_trgm;
 
--- 2) Wrapper IMMUTABLE do unaccent (necessário p/ usar em coluna gerada/índice)
-create or replace function public.f_unaccent(txt text)
-  returns text
-  language sql
-  immutable
-  parallel safe
-  strict
-as $$ select public.unaccent('public.unaccent', txt) $$;
+-- 2) Configuração de busca: português + unaccent
+--    (aplica unaccent antes do stemmer português)
+do $$
+begin
+  if not exists (select 1 from pg_ts_config where cfgname = 'pt_unaccent') then
+    create text search configuration public.pt_unaccent ( copy = pg_catalog.portuguese );
+    alter text search configuration public.pt_unaccent
+      alter mapping for hword, hword_part, word
+      with unaccent, portuguese_stem;
+  end if;
+end$$;
 
--- 3) Coluna gerada: título + categoria, minúsculo e SEM acento.
---    É preenchida automaticamente para todas as linhas (atuais e futuras).
+-- 3) Coluna tsvector gerada (título + categoria). Preenchida automaticamente
+--    para todas as linhas, atuais e futuras.
 alter table public.produtos
-  add column if not exists busca text
+  add column if not exists busca_fts tsvector
   generated always as (
-    public.f_unaccent(lower(coalesce(titulo, '') || ' ' || coalesce(tipo, '')))
+    to_tsvector('public.pt_unaccent', coalesce(titulo, '') || ' ' || coalesce(tipo, ''))
   ) stored;
 
--- 4) Índice trigram para ilike rápido na coluna de busca
-create index if not exists produtos_busca_trgm on public.produtos using gin (busca gin_trgm_ops);
+-- 4) Índice GIN para busca rápida
+create index if not exists produtos_busca_fts_idx on public.produtos using gin (busca_fts);
