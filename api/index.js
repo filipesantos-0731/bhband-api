@@ -369,6 +369,91 @@ app.get('/api/produtos', async (req, res) => {
   }
 });
 
+// ========== BUSCA DE PRODUTOS (ferramenta para o AI Agent / n8n) ==========
+// GET /api/produtos/buscar
+// Endpoint de RECUPERAÇÃO puro: recebe texto/filtros e devolve produtos.
+// Não interpreta imagem/intenção — isso é responsabilidade do agente.
+// Todos os parâmetros são opcionais e combináveis:
+//   q          termo textual (busca parcial por palavra: "caneca azul")
+//   cor        filtra por cor (presente no título da variante)
+//   categoria  filtra por tipo/categoria
+//   preco_min, preco_max  faixa de preço
+//   sku        código/handle do produto (busca parcial)
+//   id         id exato do produto (tem prioridade sobre os demais)
+//   limite     máx. de resultados (padrão 5, teto 25)
+app.get('/api/produtos/buscar', async (req, res) => {
+  try {
+    const {
+      q = '', cor = '', categoria = '',
+      preco_min = '', preco_max = '',
+      sku = '', id = '', limite = 5
+    } = req.query;
+
+    const lim = Math.min(Math.max(parseInt(limite) || 5, 1), 25);
+    // remove caracteres que quebram a sintaxe do filtro .or() do PostgREST
+    const sanit = (s) => String(s).replace(/[%,()*]/g, ' ').trim();
+
+    let query = supabase
+      .from('produtos')
+      .select('id,titulo,descricao,preco_min,imagem_principal,cores,tipo,status,url');
+
+    if (String(id).trim() && /^\d+$/.test(String(id).trim())) {
+      // Identificador específico: match exato
+      query = query.eq('id', Number(String(id).trim()));
+    } else {
+      // Busca textual parcial: cada palavra precisa casar (AND de OR-por-campo)
+      const termos = sanit(q).split(/\s+/).filter(Boolean);
+      for (const t of termos) {
+        // cada palavra precisa casar em título OU categoria (AND entre palavras)
+        query = query.or(`titulo.ilike.%${t}%,tipo.ilike.%${t}%`);
+      }
+      if (cor) query = query.ilike('titulo', `%${sanit(cor)}%`);
+      if (categoria) query = query.ilike('tipo', `%${sanit(categoria)}%`);
+      if (sku) {
+        const s = sanit(sku);
+        query = query.or(`handle.ilike.%${s}%,titulo.ilike.%${s}%`);
+      }
+      const pMin = parseFloat(preco_min);
+      const pMax = parseFloat(preco_max);
+      if (!isNaN(pMin)) query = query.gte('preco_min', pMin);
+      if (!isNaN(pMax)) query = query.lte('preco_min', pMax);
+    }
+
+    query = query
+      .not('imagem_principal', 'is', null)
+      .order('preco_min', { ascending: true })
+      .limit(lim);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const stripHtml = (h) => (h || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    const produtos = (data || []).map((p) => ({
+      id: p.id,
+      nome: p.titulo,
+      descricao: stripHtml(p.descricao).slice(0, 300),
+      preco: p.preco_min,
+      url_imagem: p.imagem_principal,
+      cor: Array.isArray(p.cores) && p.cores.length ? p.cores.join(', ') : null,
+      categoria: p.tipo || null,
+      disponivel: p.status === 'active',
+      url: p.url
+    }));
+
+    res.json({
+      ok: true,
+      total: produtos.length,
+      filtros: { q, cor, categoria, preco_min, preco_max, sku, id, limite: lim },
+      mensagem: produtos.length
+        ? `${produtos.length} produto(s) encontrado(s).`
+        : 'Nenhum produto encontrado para os filtros informados.',
+      produtos
+    });
+  } catch (erro) {
+    res.status(500).json({ ok: false, erro: erro.message, produtos: [] });
+  }
+});
+
 // Buscar produto por handle
 app.get('/api/produtos/:handle', async (req, res) => {
   try {
