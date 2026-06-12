@@ -2,7 +2,9 @@ import 'dotenv/config';
 import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { supabase } from './supabase.js';
+import { readFileSync, existsSync } from 'fs';
+import { supabase, supabaseAdmin } from './supabase.js';
+import { calcPrice, custoImpressao, extrairRef, PEDIDO_MINIMO } from './calc.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -10,6 +12,21 @@ const app = express();
 // ========== CATÁLOGO DE PRODUTOS ==========
 // Os produtos agora ficam no Supabase (tabela `produtos`).
 // Use `node scripts/sync-shopify.js` para popular/atualizar o catálogo.
+
+// ========== DADOS DE IMPRESSÃO (impressao.json) ==========
+// Preços reais de impressão por produto/quantidade, usados no cálculo do orçamento.
+let IMPRESSAO = {};
+try {
+  const p = join(__dirname, '..', 'public', 'impressao.json');
+  if (existsSync(p)) {
+    IMPRESSAO = JSON.parse(readFileSync(p, 'utf-8'));
+    console.log(`🖨️  impressao.json carregado: ${Object.keys(IMPRESSAO).length} refs`);
+  } else {
+    console.warn('⚠️  impressao.json não encontrado — orçamento usará técnicas genéricas.');
+  }
+} catch (e) {
+  console.warn('⚠️  Falha ao ler impressao.json:', e.message);
+}
 
 // Middleware
 app.use(express.json());
@@ -593,6 +610,119 @@ app.get('/api/catalogo', async (req, res) => {
     });
   } catch (erro) {
     res.status(500).json({ erro: erro.message });
+  }
+});
+
+// ========== CÁLCULO DO ORÇAMENTO (ferramenta para o AI Agent / n8n) ==========
+// GET /api/orcamento/calcular?lead_id=...&cores=...&estrategia=padrao
+// Lê os itens do orçamento do lead (tabela info_orcamento) e calcula o
+// orçamento completo: para cada item aplica markup ao produto e à impressão
+// (preços reais do impressao.json por ref + quantidade + nº de cores da logo).
+// Acionar quando for ENVIAR o orçamento ao lead.
+app.get('/api/orcamento/calcular', async (req, res) => {
+  try {
+    const { lead_id, cores = 1, estrategia = 'padrao' } = req.query;
+    if (!lead_id || !/^\d+$/.test(String(lead_id).trim())) {
+      return res.status(400).json({ ok: false, erro: 'lead_id (numérico) é obrigatório', itens: [] });
+    }
+    const est = ['teto', 'padrao', 'piso'].includes(estrategia) ? estrategia : 'padrao';
+    const nCores = Math.max(parseInt(cores) || 1, 1);
+
+    // 1) Itens do orçamento do lead
+    const { data: itensRaw, error } = await supabaseAdmin
+      .from('info_orcamento')
+      .select('product_name,product_price,product_quantity,design_info,product_sku,is_personalized')
+      .eq('lead_id', Number(lead_id));
+    if (error) throw error;
+
+    if (!itensRaw || itensRaw.length === 0) {
+      return res.json({
+        ok: true, lead_id: Number(lead_id), total: 0, itens: [],
+        mensagem: 'Nenhum item de orçamento encontrado para este lead.'
+      });
+    }
+
+    // 2) Nome do cliente (melhor esforço)
+    let cliente = null;
+    try {
+      const { data: li } = await supabaseAdmin
+        .from('lead_info').select('lead_name').eq('lead_id', Number(lead_id)).maybeSingle();
+      cliente = li?.lead_name || null;
+    } catch (_) { /* opcional */ }
+
+    // 3) Calcula cada item
+    let totalGeral = 0;
+    let custoGeral = 0;
+    const itens = itensRaw.map((it) => {
+      const qtd = Math.max(parseInt(it.product_quantity) || 1, 1);
+      const custoUnit = parseFloat(it.product_price) || 0;
+      const personalizado = !!it.is_personalized;
+
+      let impr = { custoImprUnit: 0, tecnica: null, area: null, colors: 0, fonte: null };
+      if (personalizado) {
+        const ref = extrairRef(it.product_sku);
+        const imprObj = ref ? IMPRESSAO[ref] : null;
+        impr = custoImpressao(imprObj, it.product_name || '', nCores, qtd);
+      }
+
+      const r = calcPrice(custoUnit, qtd, impr.custoImprUnit, est);
+      totalGeral += r.total;
+      custoGeral += r.custoTotalReal;
+
+      return {
+        produto: it.product_name,
+        sku: it.product_sku,
+        ref: extrairRef(it.product_sku) || null,
+        quantidade: qtd,
+        custo_unit: +custoUnit.toFixed(2),
+        personalizado,
+        design_info: it.design_info || null,
+        tecnica: personalizado ? impr.tecnica : null,
+        area_impressao: personalizado ? impr.area : null,
+        cores: personalizado ? impr.colors : 0,
+        custo_impressao_unit: +impr.custoImprUnit.toFixed(2),
+        fonte_impressao: personalizado ? impr.fonte : null,
+        markup_produto: r.mkProd,
+        markup_impressao: r.mkImpr,
+        preco_unit: +r.unit.toFixed(2),
+        subtotal: +r.total.toFixed(2),
+        margem: +(r.margem * 100).toFixed(1)
+      };
+    });
+
+    const margemTotal = totalGeral > 0 ? ((totalGeral - custoGeral) / totalGeral) * 100 : 0;
+    const atingiuMinimo = totalGeral >= PEDIDO_MINIMO;
+
+    // 4) Texto pronto para enviar ao lead
+    const fmt = (v) => 'R$ ' + (Number(v) || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const linhas = itens.map((i) =>
+      `• ${i.quantidade}x ${i.produto}${i.personalizado ? ` (${i.tecnica}${i.cores ? `, ${i.cores} cor(es)` : ''})` : ''} — ${fmt(i.preco_unit)}/un = ${fmt(i.subtotal)}`
+    );
+    const orcamento_texto =
+      `Orçamento${cliente ? ' — ' + cliente : ''}:\n` +
+      linhas.join('\n') +
+      `\n\nTotal: ${fmt(totalGeral)}` +
+      (atingiuMinimo ? '' : `\n⚠️ Abaixo do pedido mínimo de ${fmt(PEDIDO_MINIMO)}.`);
+
+    res.json({
+      ok: true,
+      lead_id: Number(lead_id),
+      cliente,
+      estrategia: est,
+      cores_logo: nCores,
+      itens,
+      totais: {
+        qtd_itens: itens.length,
+        custo_total: +custoGeral.toFixed(2),
+        total: +totalGeral.toFixed(2),
+        margem: +margemTotal.toFixed(1),
+        pedido_minimo: PEDIDO_MINIMO,
+        atingiu_minimo: atingiuMinimo
+      },
+      orcamento_texto
+    });
+  } catch (erro) {
+    res.status(500).json({ ok: false, erro: erro.message, itens: [] });
   }
 });
 

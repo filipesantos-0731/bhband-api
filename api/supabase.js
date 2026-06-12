@@ -32,3 +32,27 @@ export const supabase = new Proxy({}, {
     return typeof value === 'function' ? value.bind(c) : value;
   }
 });
+
+// ===== Cliente ADMIN (service_role) — SOMENTE servidor =====
+// Usado para ler tabelas privadas (ex.: info_orcamento, lead_info) ignorando RLS.
+// NUNCA exponha esta chave no frontend.
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+let adminClient = null;
+function getAdmin() {
+  if (adminClient) return adminClient;
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('Supabase admin não configurado: defina SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY.');
+  }
+  adminClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+    auth: { persistSession: false }
+  });
+  return adminClient;
+}
+
+export const supabaseAdmin = new Proxy({}, {
+  get(_target, prop) {
+    const c = getAdmin();
+    const value = c[prop];
+    return typeof value === 'function' ? value.bind(c) : value;
+  }
+});
