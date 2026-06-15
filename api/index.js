@@ -502,14 +502,23 @@ app.get('/api/produtos/buscar', async (req, res) => {
     }
     if (error) throw error;
 
+    // base pública desta API (funciona em prod e local): usamos para montar
+    // a url_imagem apontando para o endpoint de imagem por id ÚNICO.
+    const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+    const baseUrl = `${proto}://${req.get('host')}`;
+
     const stripHtml = (h) => (h || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
     const produtos = (data || []).map((p) => ({
       id: p.id,
+      uid: p.id, // identificador ÚNICO por produto (= id do Shopify, nunca colide)
       nome: p.titulo,
       descricao: stripHtml(p.descricao).slice(0, 300),
       preco: p.preco_min,
       sku: Array.isArray(p.variantes) && p.variantes[0] ? (p.variantes[0].sku || null) : null,
-      url_imagem: p.imagem_principal,
+      // url_imagem resolve a imagem pela id única (server-side). Qualquer node
+      // que baixe url_imagem pega o produto exato, sem depender do sku.
+      url_imagem: `${baseUrl}/api/produtos/imagem?id=${p.id}`,
+      url_imagem_cdn: p.imagem_principal, // link direto da CDN (referência/fallback)
       cor: Array.isArray(p.cores) && p.cores.length ? p.cores.join(', ') : null,
       categoria: p.tipo || null,
       disponivel: p.status === 'active',
@@ -531,36 +540,45 @@ app.get('/api/produtos/buscar', async (req, res) => {
   }
 });
 
-// GET /api/produtos/imagem?sku=...  (ou ?id= / ?handle=)
-// Busca o produto pelo SKU (ou id/handle) e devolve a IMAGEM em BINÁRIO,
-// para baixar direto no n8n (HTTP Request com Response Format = File).
+// GET /api/produtos/imagem?id=...  (ou ?uid= / ?handle= / ?sku=)
+// Busca o produto e devolve a IMAGEM em BINÁRIO, para baixar direto no n8n
+// (HTTP Request com Response Format = File).
+// Preferir id/uid: são ÚNICOS por produto. O sku pode repetir entre produtos
+// (vem das variantes); por isso, no modo sku pegamos o 1º match de forma
+// determinística — use id/uid quando precisar garantir o produto exato.
 // Precisa vir ANTES de /api/produtos/:handle, senão "imagem" vira handle.
 app.get('/api/produtos/imagem', async (req, res) => {
   try {
-    const { sku = '', id = '', handle = '' } = req.query;
+    const { sku = '', id = '', uid = '', handle = '' } = req.query;
+    // uid é só um alias semântico de id (id do produto no Shopify)
+    const idLike = String(uid || id).trim();
 
     let query = supabase
       .from('produtos')
       .select('titulo,handle,imagem_principal,variantes')
+      .order('id', { ascending: true })
       .limit(1);
 
-    if (String(id).trim() && /^\d+$/.test(String(id).trim())) {
-      query = query.eq('id', Number(String(id).trim()));
+    if (idLike && /^\d+$/.test(idLike)) {
+      query = query.eq('id', Number(idLike));
     } else if (handle) {
       query = query.eq('handle', String(handle).trim());
     } else if (sku) {
-      // match exato do SKU dentro do array JSONB de variantes.
+      // match do SKU dentro do array JSONB de variantes.
       // .contains() do supabase-js serializa errado p/ jsonb; usamos o
       // operador "cs" (@>) com a JSON string montada na mão.
       query = query.filter('variantes', 'cs', JSON.stringify([{ sku: String(sku).trim() }]));
     } else {
-      return res.status(400).json({ ok: false, erro: 'Informe sku, id ou handle.' });
+      return res.status(400).json({ ok: false, erro: 'Informe id, uid, handle ou sku.' });
     }
 
-    const { data, error } = await query.maybeSingle();
+    // não usamos .maybeSingle(): se o sku repetir, ele lançaria erro;
+    // com limit(1)+order, pegamos o 1º match de forma determinística.
+    const { data: rows, error } = await query;
     if (error) throw error;
+    const data = Array.isArray(rows) ? rows[0] : rows;
     if (!data || !data.imagem_principal) {
-      return res.status(404).json({ ok: false, erro: 'Produto ou imagem não encontrada.', sku, id, handle });
+      return res.status(404).json({ ok: false, erro: 'Produto ou imagem não encontrada.', id: idLike, sku, handle });
     }
 
     // baixa a imagem da CDN e repassa os bytes com o content-type correto
