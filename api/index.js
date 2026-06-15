@@ -723,7 +723,7 @@ app.get('/api/orcamento/calcular', async (req, res) => {
     // 1) Itens do orçamento do lead
     const { data: itensRaw, error } = await supabaseAdmin
       .from('info_orcamento')
-      .select('product_name,product_price,product_quantity,design_info,product_uid,is_personalized')
+      .select('product_name,product_price,product_quantity,design_info,product_sku,is_personalized')
       .eq('lead_id', Number(lead_id));
     if (error) throw error;
 
@@ -752,7 +752,7 @@ app.get('/api/orcamento/calcular', async (req, res) => {
 
       let impr = { custoImprUnit: 0, tecnica: null, area: null, colors: 0, fonte: null };
       if (personalizado) {
-        const ref = extrairRef(it.product_uid);
+        const ref = extrairRef(it.product_sku);
         const imprObj = ref ? IMPRESSAO[ref] : null;
         impr = custoImpressao(imprObj, it.product_name || '', nCores, qtd);
       }
@@ -763,8 +763,8 @@ app.get('/api/orcamento/calcular', async (req, res) => {
 
       return {
         produto: it.product_name,
-        uid: it.product_uid,
-        ref: extrairRef(it.product_uid) || null,
+        sku: it.product_sku,
+        ref: extrairRef(it.product_sku) || null,
         quantidade: qtd,
         custo_unit: +custoUnit.toFixed(2),
         personalizado,
