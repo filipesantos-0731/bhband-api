@@ -404,7 +404,7 @@ app.get('/api/produtos/buscar', async (req, res) => {
     const {
       q = '', cor = '', categoria = '',
       preco_min = '', preco_max = '',
-      sku = '', id = '', limite = 5
+      sku = '', id = '', uid = '', limite = 5
     } = req.query;
 
     const lim = Math.min(Math.max(parseInt(limite) || 5, 1), 25);
@@ -429,7 +429,9 @@ app.get('/api/produtos/buscar', async (req, res) => {
       'em','no','na','nos','nas','ao','aos','um','uma','uns','umas','os','as','que','ou','uns'
     ]);
 
-    const idNum = String(id).trim() && /^\d+$/.test(String(id).trim()) ? Number(String(id).trim()) : null;
+    // uid é o identificador único do produto (= id do Shopify); aceita como alias de id
+    const idLike = String(uid).trim() || String(id).trim();
+    const idNum = idLike && /^\d+$/.test(idLike) ? Number(idLike) : null;
     const termos = sanit(q)
       .split(/\s+/)
       .filter((t) => t.length >= 2 && !STOPWORDS.has(deburr(t.toLowerCase())));
@@ -721,7 +723,7 @@ app.get('/api/orcamento/calcular', async (req, res) => {
     // 1) Itens do orçamento do lead
     const { data: itensRaw, error } = await supabaseAdmin
       .from('info_orcamento')
-      .select('product_name,product_price,product_quantity,design_info,product_sku,is_personalized')
+      .select('product_name,product_price,product_quantity,design_info,product_uid,is_personalized')
       .eq('lead_id', Number(lead_id));
     if (error) throw error;
 
@@ -750,7 +752,7 @@ app.get('/api/orcamento/calcular', async (req, res) => {
 
       let impr = { custoImprUnit: 0, tecnica: null, area: null, colors: 0, fonte: null };
       if (personalizado) {
-        const ref = extrairRef(it.product_sku);
+        const ref = extrairRef(it.product_uid);
         const imprObj = ref ? IMPRESSAO[ref] : null;
         impr = custoImpressao(imprObj, it.product_name || '', nCores, qtd);
       }
@@ -761,8 +763,8 @@ app.get('/api/orcamento/calcular', async (req, res) => {
 
       return {
         produto: it.product_name,
-        sku: it.product_sku,
-        ref: extrairRef(it.product_sku) || null,
+        uid: it.product_uid,
+        ref: extrairRef(it.product_uid) || null,
         quantidade: qtd,
         custo_unit: +custoUnit.toFixed(2),
         personalizado,
