@@ -444,7 +444,7 @@ app.get('/api/produtos/buscar', async (req, res) => {
     function base() {
       return supabase
         .from('produtos')
-        .select('id,titulo,descricao,preco_min,imagem_principal,cores,tipo,status,url');
+        .select('id,titulo,descricao,preco_min,imagem_principal,cores,tipo,status,url,variantes');
     }
     function filtrosComuns(qy) {
       if (sku) {
@@ -459,31 +459,45 @@ app.get('/api/produtos/buscar', async (req, res) => {
         .limit(lim);
     }
 
+    // Listas de termos a tentar, da mais específica à mais ampla: começamos com
+    // TODAS as palavras e, se não achar nada, vamos descartando a última (as
+    // menos importantes costumam vir no fim: "caneca térmica verde fosca inox
+    // 350ml" → cai para "caneca térmica verde"). Para na primeira que retornar
+    // algo, ou quando sobra 1 termo. Mantém relevância (preserva as 1ªs palavras).
+    const tentativas = [];
+    for (let n = termosTexto.length; n >= 1; n--) tentativas.push(termosTexto.slice(0, n));
+    if (tentativas.length === 0) tentativas.push([]); // sem termo textual: só filtros
+
     // Modo 1 (preferido): full-text português + unaccent (coluna busca_fts).
-    function montarFTS() {
+    function montarFTS(lista) {
       let qy = base();
       if (idNum !== null) qy = qy.eq('id', idNum);
-      else if (termosTexto.length) {
-        qy = qy.textSearch('busca_fts', termosTexto.join(' '), { type: 'websearch', config: 'pt_unaccent' });
-      }
+      else if (lista.length) qy = qy.textSearch('busca_fts', lista.join(' '), { type: 'websearch', config: 'pt_unaccent' });
       return filtrosComuns(qy);
     }
-    // Modo 2 (fallback, se busca_fts ainda não existir): ilike em título/categoria.
-    function montarTitulo() {
+    // Modo 2 (fallback, se busca_fts não existir): ilike (AND) em título/categoria.
+    function montarTitulo(lista) {
       let qy = base();
       if (idNum !== null) qy = qy.eq('id', idNum);
-      else {
-        for (const t of termos) qy = qy.or(`titulo.ilike.%${t}%,tipo.ilike.%${t}%`);
-        if (cor) qy = qy.ilike('titulo', `%${sanit(cor)}%`);
-        if (categoria) qy = qy.ilike('tipo', `%${sanit(categoria)}%`);
-      }
+      else for (const t of lista) qy = qy.or(`titulo.ilike.%${t}%,tipo.ilike.%${t}%`);
       return filtrosComuns(qy);
     }
 
-    let { data, error } = await montarFTS();
-    // busca_fts/config ainda não criados → cai no modo título
-    if (error && /busca_fts|pt_unaccent|text search/i.test(error.message || '')) {
-      ({ data, error } = await montarTitulo());
+    let data = null, error = null, ampliou = false, semFts = false;
+    if (idNum !== null) {
+      ({ data, error } = await montarFTS([])); // só eq('id') + filtros comuns
+    } else {
+      for (let i = 0; i < tentativas.length; i++) {
+        const lista = tentativas[i];
+        if (!semFts) {
+          ({ data, error } = await montarFTS(lista));
+          // coluna busca_fts ainda não criada → daqui pra frente usa só ilike
+          if (error && /busca_fts|pt_unaccent|text search/i.test(error.message || '')) semFts = true;
+        }
+        if (semFts) ({ data, error } = await montarTitulo(lista));
+        if (error) break;
+        if (data && data.length) { ampliou = i > 0; break; } // achou: para
+      }
     }
     if (error) throw error;
 
@@ -493,6 +507,7 @@ app.get('/api/produtos/buscar', async (req, res) => {
       nome: p.titulo,
       descricao: stripHtml(p.descricao).slice(0, 300),
       preco: p.preco_min,
+      sku: Array.isArray(p.variantes) && p.variantes[0] ? (p.variantes[0].sku || null) : null,
       url_imagem: p.imagem_principal,
       cor: Array.isArray(p.cores) && p.cores.length ? p.cores.join(', ') : null,
       categoria: p.tipo || null,
@@ -503,6 +518,7 @@ app.get('/api/produtos/buscar', async (req, res) => {
     res.json({
       ok: true,
       total: produtos.length,
+      busca_ampliada: ampliou, // true quando relaxamos a query para não voltar vazio
       filtros: { q, cor, categoria, preco_min, preco_max, sku, id, limite: lim },
       mensagem: produtos.length
         ? `${produtos.length} produto(s) encontrado(s).`
