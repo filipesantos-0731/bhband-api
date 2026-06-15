@@ -152,6 +152,7 @@ app.get('/', (req, res) => {
       catalogo: 'GET /api/catalogo',
       produtos: 'GET /api/produtos?busca=&tipo=&pagina=&limite=',
       produto: 'GET /api/produtos/:handle',
+      produto_imagem: 'GET /api/produtos/imagem?sku=|id=|handle= (retorna a imagem em binário)',
       tipos: 'GET /api/tipos',
       calcular: 'POST /api/calcular-orcamento',
       calcular_produto: 'POST /api/calcular-produto',
@@ -527,6 +528,61 @@ app.get('/api/produtos/buscar', async (req, res) => {
     });
   } catch (erro) {
     res.status(500).json({ ok: false, erro: erro.message, produtos: [] });
+  }
+});
+
+// GET /api/produtos/imagem?sku=...  (ou ?id= / ?handle=)
+// Busca o produto pelo SKU (ou id/handle) e devolve a IMAGEM em BINÁRIO,
+// para baixar direto no n8n (HTTP Request com Response Format = File).
+// Precisa vir ANTES de /api/produtos/:handle, senão "imagem" vira handle.
+app.get('/api/produtos/imagem', async (req, res) => {
+  try {
+    const { sku = '', id = '', handle = '' } = req.query;
+
+    let query = supabase
+      .from('produtos')
+      .select('titulo,handle,imagem_principal,variantes')
+      .limit(1);
+
+    if (String(id).trim() && /^\d+$/.test(String(id).trim())) {
+      query = query.eq('id', Number(String(id).trim()));
+    } else if (handle) {
+      query = query.eq('handle', String(handle).trim());
+    } else if (sku) {
+      // match exato do SKU dentro do array JSONB de variantes.
+      // .contains() do supabase-js serializa errado p/ jsonb; usamos o
+      // operador "cs" (@>) com a JSON string montada na mão.
+      query = query.filter('variantes', 'cs', JSON.stringify([{ sku: String(sku).trim() }]));
+    } else {
+      return res.status(400).json({ ok: false, erro: 'Informe sku, id ou handle.' });
+    }
+
+    const { data, error } = await query.maybeSingle();
+    if (error) throw error;
+    if (!data || !data.imagem_principal) {
+      return res.status(404).json({ ok: false, erro: 'Produto ou imagem não encontrada.', sku, id, handle });
+    }
+
+    // baixa a imagem da CDN e repassa os bytes com o content-type correto
+    const imgResp = await fetch(data.imagem_principal);
+    if (!imgResp.ok) {
+      return res.status(502).json({ ok: false, erro: `Falha ao baixar a imagem (HTTP ${imgResp.status}).` });
+    }
+    const contentType = (imgResp.headers.get('content-type') || 'image/jpeg').split(';')[0];
+    const ext = (contentType.split('/')[1] || 'jpg');
+    const buffer = Buffer.from(await imgResp.arrayBuffer());
+
+    const nomeArquivo = String(data.handle || data.titulo || 'produto')
+      .normalize('NFD').replace(/[̀-ͯ]/g, '')
+      .replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
+      .toLowerCase() || 'produto';
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Length', buffer.length);
+    res.setHeader('Content-Disposition', `inline; filename="${nomeArquivo}.${ext}"`);
+    return res.end(buffer);
+  } catch (erro) {
+    res.status(500).json({ ok: false, erro: erro.message });
   }
 });
 
