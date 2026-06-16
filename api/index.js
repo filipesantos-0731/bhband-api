@@ -153,6 +153,7 @@ app.get('/', (req, res) => {
       produtos: 'GET /api/produtos?busca=&tipo=&pagina=&limite=',
       produto: 'GET /api/produtos/:handle',
       produto_imagem: 'GET /api/produtos/imagem?sku=|id=|handle= (retorna a imagem em binário)',
+      produto_ficha: 'GET /api/produtos/ficha?uid=|id=|handle= (ficha do produto em JSON plano)',
       tipos: 'GET /api/tipos',
       calcular: 'POST /api/calcular-orcamento',
       calcular_produto: 'POST /api/calcular-produto',
@@ -601,6 +602,47 @@ app.get('/api/produtos/imagem', async (req, res) => {
     res.setHeader('Content-Length', buffer.length);
     res.setHeader('Content-Disposition', `inline; filename="${nomeArquivo}.${ext}"`);
     return res.end(buffer);
+  } catch (erro) {
+    res.status(500).json({ ok: false, erro: erro.message });
+  }
+});
+
+// GET /api/produtos/ficha?uid=...  (ou ?id= / ?handle=)
+// Retorna a FICHA do produto em JSON PLANO (1 objeto), pronta para montar a
+// legenda e enviar no n8n. url_imagem = link DIRETO da CDN da Shopify.
+// Precisa vir ANTES de /api/produtos/:handle, senão "ficha" vira handle.
+app.get('/api/produtos/ficha', async (req, res) => {
+  try {
+    const { uid = '', id = '', handle = '' } = req.query;
+    const idLike = String(uid || id).trim();
+
+    let query = supabase
+      .from('produtos')
+      .select('id,handle,titulo,descricao,preco_min,imagem_principal,cores,tipo,status,url,variantes')
+      .limit(1);
+
+    if (idLike && /^\d+$/.test(idLike)) query = query.eq('id', Number(idLike));
+    else if (handle) query = query.eq('handle', String(handle).trim());
+    else return res.status(400).json({ ok: false, erro: 'Informe uid, id ou handle.' });
+
+    const { data, error } = await query.maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ ok: false, erro: 'Produto não encontrado.', uid: idLike });
+
+    const stripHtml = (h) => (h || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    res.json({
+      ok: true,
+      uid: data.id,
+      nome: data.titulo,
+      preco: data.preco_min,
+      sku: Array.isArray(data.variantes) && data.variantes[0] ? (data.variantes[0].sku || null) : null,
+      cor: Array.isArray(data.cores) && data.cores.length ? data.cores.join(', ') : null,
+      categoria: data.tipo || null,
+      disponivel: data.status === 'active',
+      descricao: stripHtml(data.descricao).slice(0, 300) || null,
+      url: data.url || null,                  // link do produto no site
+      url_imagem: data.imagem_principal || null // link DIRETO da imagem na CDN da Shopify
+    });
   } catch (erro) {
     res.status(500).json({ ok: false, erro: erro.message });
   }
