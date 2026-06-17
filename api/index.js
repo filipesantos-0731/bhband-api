@@ -400,15 +400,35 @@ app.get('/api/produtos', async (req, res) => {
 //   sku        código/handle do produto (busca parcial)
 //   id         id exato do produto (tem prioridade sobre os demais)
 //   limite     máx. de resultados (padrão 5, teto 25)
+// Nome "base" do produto: remove o sufixo de cor do título ("Pulseira ... - Azul"
+// -> "Pulseira ..."). Cada cor é uma linha/produto separado no catálogo, mas o
+// produto base é o mesmo (descrição idêntica). Usado para agrupar as cores.
+function nomeBaseProduto(titulo, cores) {
+  let t = String(titulo || '').trim();
+  const cor = Array.isArray(cores) && cores.length ? String(cores[0]).trim() : '';
+  if (cor) {
+    const esc = cor.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const t2 = t.replace(new RegExp('\\s*[-–]\\s*' + esc + '\\s*$', 'i'), '').trim();
+    if (t2 && t2 !== t) return t2;
+  }
+  const idx = t.lastIndexOf(' - ');
+  return idx > 0 ? t.slice(0, idx).trim() : t;
+}
+
 app.get('/api/produtos/buscar', async (req, res) => {
   try {
     const {
       q = '', cor = '', categoria = '',
       preco_min = '', preco_max = '',
-      sku = '', id = '', uid = '', limite = 5
+      sku = '', id = '', uid = '', limite = 5, agrupar = ''
     } = req.query;
 
     const lim = Math.min(Math.max(parseInt(limite) || 5, 1), 25);
+    // modo agrupado: junta as cores do mesmo produto base numa única entrada
+    const agrup = /^(1|true|sim)$/i.test(String(agrupar).trim());
+    // no modo agrupado buscamos MAIS linhas (para capturar as várias cores) e
+    // depois agrupamos e cortamos para 'lim' produtos base.
+    const limDb = agrup ? Math.min(Math.max(lim * 15, 60), 300) : lim;
     // remove caracteres que quebram a sintaxe do filtro .or() do PostgREST
     const sanit = (s) => String(s).replace(/[%,()*]/g, ' ').trim();
     // remove acentos para comparar com a lista de palavras ignoradas
@@ -460,7 +480,7 @@ app.get('/api/produtos/buscar', async (req, res) => {
       return qy
         .not('imagem_principal', 'is', null)
         .order('preco_min', { ascending: true })
-        .limit(lim);
+        .limit(limDb);
     }
 
     // Listas de termos a tentar, da mais específica à mais ampla: começamos com
@@ -511,6 +531,62 @@ app.get('/api/produtos/buscar', async (req, res) => {
     const baseUrl = `${proto}://${req.get('host')}`;
 
     const stripHtml = (h) => (h || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+
+    // ===== Modo AGRUPADO: 1 entrada por produto base, com as cores juntas =====
+    if (agrup) {
+      const grupos = new Map();
+      for (const p of (data || [])) {
+        const nb = nomeBaseProduto(p.titulo, p.cores);
+        const key = deburr(nb.toLowerCase());
+        if (!grupos.has(key)) grupos.set(key, { nome: nb, itens: [] });
+        grupos.get(key).itens.push(p);
+      }
+      let grupados = [...grupos.values()].map((g) => {
+        g.itens.sort((a, b) => (a.preco_min || 0) - (b.preco_min || 0));
+        const rep = g.itens[0]; // representante = cor mais barata
+        const cores = [...new Set(
+          g.itens.flatMap((p) => (Array.isArray(p.cores) ? p.cores : [])).filter(Boolean)
+        )];
+        const precos = g.itens.map((p) => p.preco_min || 0);
+        return {
+          uid: rep.id,                 // uid representativo (cor mais barata)
+          nome: g.nome,                // nome base, sem a cor
+          categoria: rep.tipo || null,
+          preco: rep.preco_min,
+          preco_min: Math.min(...precos),
+          preco_max: Math.max(...precos),
+          disponivel: g.itens.some((p) => p.status === 'active'),
+          total_cores: cores.length,
+          cores,                       // todas as cores disponíveis do produto
+          descricao: stripHtml(rep.descricao).slice(0, 300),
+          url: rep.url,
+          url_imagem: `${baseUrl}/api/produtos/imagem?id=${rep.id}`,
+          url_imagem_cdn: rep.imagem_principal,
+          // mapa cor -> uid real daquela cor (para escolher uma cor específica)
+          cores_uids: g.itens.map((p) => ({
+            cor: Array.isArray(p.cores) && p.cores.length ? p.cores.join(', ') : null,
+            uid: p.id,
+            preco: p.preco_min,
+            url: p.url,
+            url_imagem: `${baseUrl}/api/produtos/imagem?id=${p.id}`
+          }))
+        };
+      });
+      grupados.sort((a, b) => a.preco_min - b.preco_min);
+      grupados = grupados.slice(0, lim);
+      return res.json({
+        ok: true,
+        agrupado: true,
+        total: grupados.length,
+        busca_ampliada: ampliou,
+        filtros: { q, cor, categoria, preco_min, preco_max, sku, id, limite: lim, agrupar: true },
+        mensagem: grupados.length
+          ? `${grupados.length} produto(s) encontrado(s) (cores agrupadas).`
+          : 'Nenhum produto encontrado para os filtros informados.',
+        produtos: grupados
+      });
+    }
+
     const produtos = (data || []).map((p) => ({
       id: p.id,
       uid: p.id, // identificador ÚNICO por produto (= id do Shopify, nunca colide)
@@ -630,13 +706,44 @@ app.get('/api/produtos/ficha', async (req, res) => {
     if (!data) return res.status(404).json({ ok: false, erro: 'Produto não encontrado.', uid: idLike });
 
     const stripHtml = (h) => (h || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    const deburr = (s) => String(s).normalize('NFD').replace(/[̀-ͯ]/g, '');
+
+    // Cores disponíveis do MESMO produto base (cada cor é uma linha separada).
+    const baseNome = nomeBaseProduto(data.titulo, data.cores);
+    let cores_disponiveis = Array.isArray(data.cores) ? data.cores.filter(Boolean) : [];
+    let cores_uids = [{ cor: cores_disponiveis.join(', ') || null, uid: data.id }];
+    try {
+      let qy = supabase
+        .from('produtos')
+        .select('id,titulo,cores')
+        .ilike('titulo', `${baseNome.replace(/[%_]/g, ' ').trim()}%`)
+        .not('imagem_principal', 'is', null)
+        .limit(60);
+      if (data.tipo) qy = qy.eq('tipo', data.tipo);
+      const { data: irmaos } = await qy;
+      const mesmos = (irmaos || []).filter(
+        (p) => deburr(nomeBaseProduto(p.titulo, p.cores).toLowerCase()) === deburr(baseNome.toLowerCase())
+      );
+      if (mesmos.length) {
+        cores_disponiveis = [...new Set(mesmos.flatMap((p) => (Array.isArray(p.cores) ? p.cores : [])).filter(Boolean))];
+        cores_uids = mesmos.map((p) => ({
+          cor: Array.isArray(p.cores) && p.cores.length ? p.cores.join(', ') : null,
+          uid: p.id
+        }));
+      }
+    } catch (_) { /* fallback: só a cor do próprio produto */ }
+
     res.json({
       ok: true,
       uid: data.id,
       nome: data.titulo,
+      nome_base: baseNome,                      // nome sem a cor (para apresentar)
       preco: data.preco_min,
       sku: Array.isArray(data.variantes) && data.variantes[0] ? (data.variantes[0].sku || null) : null,
       cor: Array.isArray(data.cores) && data.cores.length ? data.cores.join(', ') : null,
+      cores_disponiveis,                        // todas as cores do produto base
+      total_cores: cores_disponiveis.length,
+      cores_uids,                               // mapa cor -> uid real de cada cor
       categoria: data.tipo || null,
       disponivel: data.status === 'active',
       descricao: stripHtml(data.descricao).slice(0, 300) || null,
