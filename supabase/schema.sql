@@ -32,6 +32,19 @@ alter table public.produtos add column if not exists opcoes      jsonb default '
 alter table public.produtos add column if not exists cores       text[] default '{}';
 alter table public.produtos add column if not exists variantes   jsonb default '[]';
 alter table public.produtos add column if not exists preco_max   numeric(12,2) default 0;
+-- Distinção personalizado x normal:
+--   personalizado = título traz a palavra "personalizad@" (ex.: "... Slim Laser Personalizada")
+--   nome_base     = nome canônico SEM a cor e SEM a palavra "personalizad@".
+--   Os dois lados do par (normal e personalizada) compartilham o MESMO nome_base,
+--   o que permite a IA achar a versão equivalente. Veja scripts/sync-shopify.js.
+alter table public.produtos add column if not exists personalizado boolean default false;
+alter table public.produtos add column if not exists nome_base     text;
+-- Identificador hierárquico legível (gerado por scripts/backfill-personalizado.js):
+--   produto_uid = 7 dígitos, ÚNICO por produto (compartilhado pelas variantes).
+--   uid         = 9 dígitos = produto_uid (7) + variante (2). "00" = sem variante,
+--                 "01".."24" = cada variante. Só números, sem traço, sem colisão.
+alter table public.produtos add column if not exists produto_uid text;
+alter table public.produtos add column if not exists uid         text;
 
 -- Índices para busca e filtros rápidos
 create index if not exists produtos_tipo_idx        on public.produtos (tipo);
@@ -39,6 +52,12 @@ create index if not exists produtos_preco_idx       on public.produtos (preco_mi
 create index if not exists produtos_tags_idx        on public.produtos using gin (tags);
 create index if not exists produtos_cores_idx       on public.produtos using gin (cores);
 create index if not exists produtos_status_idx      on public.produtos (status);
+create index if not exists produtos_personalizado_idx on public.produtos (personalizado);
+-- uid é único por variante (lookup em ficha/imagem); produto_uid agrupa as variantes
+create unique index if not exists produtos_uid_uidx       on public.produtos (uid);
+create index        if not exists produtos_produto_uid_idx on public.produtos (produto_uid);
+-- nome_base é a chave que liga normal <-> personalizada; índice p/ casar o par rápido
+create index if not exists produtos_nome_base_trgm_idx on public.produtos using gin (nome_base gin_trgm_ops);
 -- Busca textual por título (case-insensitive, com pg_trgm para ilike rápido)
 create extension if not exists pg_trgm;
 create index if not exists produtos_titulo_trgm_idx on public.produtos using gin (titulo gin_trgm_ops);

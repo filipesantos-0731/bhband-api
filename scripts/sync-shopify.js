@@ -77,6 +77,32 @@ function slug(s) {
     .replace(/(^-|-$)/g, '');
 }
 
+// Detecção de "personalizado": a palavra "personalizad@" como ADJETIVO no título
+// (ex.: "... Slim Laser Personalizada", "Copo EcoLabel Personalizado 500 ML").
+// NÃO casa "Personalização" (substantivo, ex.: "Placa para Personalização") nem
+// "personalizável" — esses são descritivos, não a versão personalizada do SKU.
+const RE_PERSONALIZADO = /\bpersonalizad[oa]s?\b/i;
+function ehPersonalizado(titulo) {
+  return RE_PERSONALIZADO.test(titulo || '');
+}
+
+// nome_base = nome canônico que liga as versões normal e personalizada do mesmo
+// produto: tira o sufixo de cor ("- Azul") e remove a palavra "personalizad@".
+// Ex.: "Pulseira ... Slim Laser - Azul"            -> "Pulseira ... Slim Laser"
+//      "Pulseira ... Slim Laser Personalizada - Azul" -> "Pulseira ... Slim Laser"
+// Os dois caem na MESMA string, então a IA acha o par casando por nome_base.
+function nomeBase(titulo, cor) {
+  let t = String(titulo || '').trim();
+  if (cor) {
+    const esc = String(cor).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    t = t.replace(new RegExp('\\s*[-–]\\s*' + esc + '\\s*$', 'i'), '').trim();
+  } else {
+    const idx = t.lastIndexOf(' - ');
+    if (idx > 0) t = t.slice(0, idx).trim();
+  }
+  return t.replace(/\s*\bpersonalizad[oa]s?\b\s*/i, ' ').replace(/\s+/g, ' ').trim();
+}
+
 // Controla unicidade global dos handles (a coluna handle tem UNIQUE)
 const handlesUsados = new Set();
 function handleUnico(base, varianteId) {
@@ -137,6 +163,8 @@ function mapVariantes(p) {
       handle: handleUnico(handleBase, v.id),
       titulo,
       ...base,
+      personalizado: ehPersonalizado(titulo),
+      nome_base: nomeBase(titulo, cor),
       imagem_principal: imagem,
       cores: cor ? [cor] : [],
       variantes: [{

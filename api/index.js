@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { readFileSync, existsSync } from 'fs';
 import { supabase, supabaseAdmin } from './supabase.js';
-import { calcPrice, custoImpressao, extrairRef, PEDIDO_MINIMO } from './calc.js';
+import { calcPrice, PEDIDO_MINIMO } from './calc.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -415,13 +415,125 @@ function nomeBaseProduto(titulo, cores) {
   return idx > 0 ? t.slice(0, idx).trim() : t;
 }
 
+// Remove tags HTML e normaliza espaços (descrição vem como body_html do Shopify).
+function stripHtml(h) {
+  return (h || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// Representante de uma versão (conjunto de linhas-cor): ativo mais barato,
+// já com TODAS as cores daquela versão e o mapa cor -> uid/preço/imagem.
+// IMPORTANTE: a descrição/categoria/imagem saem da PRÓPRIA versão (a linha
+// representante), nunca de outra versão — normal e personalizada têm descrições
+// diferentes no Shopify, então não podem ser misturadas.
+function representanteVersao(linhas, baseUrl) {
+  if (!linhas || !linhas.length) return null;
+  const ord = [...linhas].sort((a, b) => {
+    const aA = a.status === 'active', bA = b.status === 'active';
+    if (aA !== bA) return aA ? -1 : 1;
+    return (a.preco_min || 0) - (b.preco_min || 0);
+  });
+  const r = ord[0];
+  const precos = linhas.map((x) => x.preco_min || 0);
+  const cores = [...new Set(ord.flatMap((x) => (Array.isArray(x.cores) ? x.cores : [])).filter(Boolean))];
+  // uid novo (produto_uid + variante); cai para o id da variante se ainda não tiver backfill
+  const refUid = (x) => x.uid || String(x.id);
+  const cores_uids = ord.map((x) => ({
+    cor: Array.isArray(x.cores) && x.cores.length ? x.cores.join(', ') : null,
+    uid: refUid(x),
+    preco: x.preco_min,
+    disponivel: x.status === 'active',
+    url: x.url,
+    url_imagem: `${baseUrl}/api/produtos/imagem?uid=${refUid(x)}`
+  }));
+  return {
+    uid: refUid(r),
+    produto_uid: r.produto_uid || null,
+    preco: r.preco_min,
+    preco_min: Math.min(...precos),
+    preco_max: Math.max(...precos),
+    total_cores: cores.length,
+    cores,
+    cores_uids,
+    descricao: stripHtml(r.descricao) || null, // descrição COMPLETA desta versão
+    categoria: r.tipo || null,
+    disponivel: linhas.some((x) => x.status === 'active'),
+    url: r.url,
+    url_imagem: `${baseUrl}/api/produtos/imagem?uid=${refUid(r)}`,
+    url_imagem_cdn: r.imagem_principal || null
+  };
+}
+
+// Dado um conjunto de nome_base, devolve um mapa nome_base -> { normal, personalizada }
+// com o representante de cada versão. É assim que a IA "acha o par": normal e
+// personalizada compartilham o mesmo nome_base. Quando uma das versões não existe,
+// ela vem como null. Uma única query para todos os bases.
+async function resolverVersoes(nomeBases, baseUrl) {
+  const bases = [...new Set((nomeBases || []).filter(Boolean))];
+  const mapa = new Map();
+  if (!bases.length) return mapa;
+
+  const { data, error } = await supabase
+    .from('produtos')
+    .select('id,uid,produto_uid,titulo,nome_base,personalizado,preco_min,cores,status,url,imagem_principal,descricao,tipo')
+    .in('nome_base', bases)
+    .not('imagem_principal', 'is', null);
+  if (error || !data) return mapa;
+
+  // agrupa por nome_base -> linhas de cada versão
+  const grupos = new Map();
+  for (const p of data) {
+    if (!grupos.has(p.nome_base)) grupos.set(p.nome_base, { normal: [], personalizada: [] });
+    (p.personalizado ? grupos.get(p.nome_base).personalizada : grupos.get(p.nome_base).normal).push(p);
+  }
+  for (const [nb, g] of grupos) {
+    mapa.set(nb, {
+      normal: representanteVersao(g.normal, baseUrl),
+      personalizada: representanteVersao(g.personalizada, baseUrl)
+    });
+  }
+  return mapa;
+}
+
+// Resolve uma referência (uid da variante / produto_uid / id antigo) para a linha
+// do produto. Ordem: 1) uid exato da variante; 2) produto_uid -> variante
+// representativa (ativa mais barata); 3) id antigo da variante (numérico).
+// Retorna a linha completa (*) ou null.
+async function acharLinhaPorRef(ref) {
+  const r = String(ref || '').trim();
+  if (!r) return null;
+  // 1) uid da variante (9 díg)
+  let { data } = await supabase.from('produtos').select('*').eq('uid', r).limit(1);
+  if (data && data.length) return data[0];
+  // 2) produto_uid (7 díg) -> escolhe a variante ativa mais barata
+  ({ data } = await supabase.from('produtos').select('*').eq('produto_uid', r));
+  if (data && data.length) {
+    data.sort((a, b) => {
+      const aA = a.status === 'active', bA = b.status === 'active';
+      if (aA !== bA) return aA ? -1 : 1;
+      return (a.preco_min || 0) - (b.preco_min || 0);
+    });
+    return data[0];
+  }
+  // 3) id antigo da variante (compatibilidade)
+  if (/^\d+$/.test(r)) {
+    ({ data } = await supabase.from('produtos').select('*').eq('id', Number(r)).limit(1));
+    if (data && data.length) return data[0];
+  }
+  return null;
+}
+
 app.get('/api/produtos/buscar', async (req, res) => {
   try {
     const {
       q = '', cor = '', categoria = '',
       preco_min = '', preco_max = '',
-      sku = '', id = '', uid = '', limite = 5, agrupar = ''
+      sku = '', id = '', uid = '', limite = 5, agrupar = '',
+      personalizado = ''
     } = req.query;
+    // filtro opcional: true => só personalizados; false => só normais; '' => ambos
+    const filtroPers = /^(1|true|sim)$/i.test(String(personalizado).trim()) ? true
+      : /^(0|false|nao|não)$/i.test(String(personalizado).trim()) ? false
+      : null;
 
     const lim = Math.min(Math.max(parseInt(limite) || 5, 1), 25);
     // modo agrupado: junta as cores do mesmo produto base numa única entrada
@@ -450,9 +562,10 @@ app.get('/api/produtos/buscar', async (req, res) => {
       'em','no','na','nos','nas','ao','aos','um','uma','uns','umas','os','as','que','ou','uns'
     ]);
 
-    // uid é o identificador único do produto (= id do Shopify); aceita como alias de id
+    // uid/id: aceita o uid novo da variante (9 díg), o produto_uid (7 díg, traz todas
+    // as variantes) ou o id antigo da variante. Tudo só números.
     const idLike = String(uid).trim() || String(id).trim();
-    const idNum = idLike && /^\d+$/.test(idLike) ? Number(idLike) : null;
+    const idFiltro = idLike && /^\d+$/.test(idLike) ? idLike : null;
     const termos = sanit(q)
       .split(/\s+/)
       .filter((t) => t.length >= 2 && !STOPWORDS.has(deburr(t.toLowerCase())));
@@ -468,13 +581,16 @@ app.get('/api/produtos/buscar', async (req, res) => {
     function base() {
       return supabase
         .from('produtos')
-        .select('id,titulo,descricao,preco_min,imagem_principal,cores,tipo,status,url,variantes');
+        .select('id,uid,produto_uid,titulo,descricao,preco_min,imagem_principal,cores,tipo,status,url,variantes,personalizado,nome_base');
     }
+    // filtro exato por uid (variante, 9 díg), produto_uid (7 díg) ou id antigo
+    const aplicarIdFiltro = (qy) => qy.or(`uid.eq.${idFiltro},produto_uid.eq.${idFiltro},id.eq.${idFiltro}`);
     function filtrosComuns(qy) {
       if (sku) {
         const s = sanit(sku);
         qy = qy.or(`handle.ilike.%${s}%,titulo.ilike.%${s}%`);
       }
+      if (filtroPers !== null) qy = qy.eq('personalizado', filtroPers);
       if (!isNaN(pMin)) qy = qy.gte('preco_min', pMin);
       if (!isNaN(pMax)) qy = qy.lte('preco_min', pMax);
       return qy
@@ -495,21 +611,21 @@ app.get('/api/produtos/buscar', async (req, res) => {
     // Modo 1 (preferido): full-text português + unaccent (coluna busca_fts).
     function montarFTS(lista) {
       let qy = base();
-      if (idNum !== null) qy = qy.eq('id', idNum);
+      if (idFiltro !== null) qy = aplicarIdFiltro(qy);
       else if (lista.length) qy = qy.textSearch('busca_fts', lista.join(' '), { type: 'websearch', config: 'pt_unaccent' });
       return filtrosComuns(qy);
     }
     // Modo 2 (fallback, se busca_fts não existir): ilike (AND) em título/categoria.
     function montarTitulo(lista) {
       let qy = base();
-      if (idNum !== null) qy = qy.eq('id', idNum);
+      if (idFiltro !== null) qy = aplicarIdFiltro(qy);
       else for (const t of lista) qy = qy.or(`titulo.ilike.%${t}%,tipo.ilike.%${t}%`);
       return filtrosComuns(qy);
     }
 
     let data = null, error = null, ampliou = false, semFts = false;
-    if (idNum !== null) {
-      ({ data, error } = await montarFTS([])); // só eq('id') + filtros comuns
+    if (idFiltro !== null) {
+      ({ data, error } = await montarFTS([])); // só filtro de id/uid + filtros comuns
     } else {
       for (let i = 0; i < tentativas.length; i++) {
         const lista = tentativas[i];
@@ -530,46 +646,54 @@ app.get('/api/produtos/buscar', async (req, res) => {
     const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
     const baseUrl = `${proto}://${req.get('host')}`;
 
-    const stripHtml = (h) => (h || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-
-    // ===== Modo AGRUPADO: 1 entrada por produto base, com as cores juntas =====
+    // ===== Modo AGRUPADO: 1 entrada por produto, com as cores juntas =====
+    // Agrupa pelo nome_base CANÔNICO (sem cor E sem "personalizada"): assim a
+    // versão normal e a personalizada do MESMO produto colapsam numa entrada só
+    // (e cópias idênticas somem). Representamos pela versão NORMAL quando ela
+    // existe; a personalizada equivalente fica em `versoes.personalizada`/`tem_par`
+    // para a IA buscar caso o cliente peça a personalizada.
     if (agrup) {
-      const grupos = new Map();
+      const canonicalBase = (p) => p.nome_base
+        || nomeBaseProduto(p.titulo, p.cores).replace(/\s*\bpersonalizad[oa]s?\b\s*/i, ' ').replace(/\s+/g, ' ').trim();
+      const grupos = new Map(); // chave canônica -> { nome, nbExact, itens }
       for (const p of (data || [])) {
-        const nb = nomeBaseProduto(p.titulo, p.cores);
+        const nb = canonicalBase(p);
         const key = deburr(nb.toLowerCase());
-        if (!grupos.has(key)) grupos.set(key, { nome: nb, itens: [] });
+        if (!grupos.has(key)) grupos.set(key, { nome: nb, nbExact: p.nome_base || nb, itens: [] });
         grupos.get(key).itens.push(p);
       }
+      // versões completas (todas as cores/preços) de cada base, para achar a personalizada
+      const versoesMap = await resolverVersoes([...grupos.values()].map((g) => g.nbExact), baseUrl);
+
       let grupados = [...grupos.values()].map((g) => {
-        g.itens.sort((a, b) => (a.preco_min || 0) - (b.preco_min || 0));
-        const rep = g.itens[0]; // representante = cor mais barata
-        const cores = [...new Set(
-          g.itens.flatMap((p) => (Array.isArray(p.cores) ? p.cores : [])).filter(Boolean)
-        )];
-        const precos = g.itens.map((p) => p.preco_min || 0);
+        const par = versoesMap.get(g.nbExact) || { normal: null, personalizada: null };
+        // fallback (pré-backfill, sem nome_base/versoes): usa as linhas da própria busca
+        const repNormal = par.normal || representanteVersao(g.itens.filter((x) => !x.personalizado), baseUrl);
+        const repPers = par.personalizada || representanteVersao(g.itens.filter((x) => x.personalizado), baseUrl);
+        const rep = repNormal || repPers;       // prioriza a versão NORMAL
+        const ehPers = !repNormal;               // só personalizado quando não há normal
         return {
-          uid: rep.id,                 // uid representativo (cor mais barata)
-          nome: g.nome,                // nome base, sem a cor
-          categoria: rep.tipo || null,
-          preco: rep.preco_min,
-          preco_min: Math.min(...precos),
-          preco_max: Math.max(...precos),
-          disponivel: g.itens.some((p) => p.status === 'active'),
-          total_cores: cores.length,
-          cores,                       // todas as cores disponíveis do produto
-          descricao: stripHtml(rep.descricao).slice(0, 300),
+          uid: rep.uid,                // uid da variante representativa (9 díg)
+          produto_uid: rep.produto_uid, // uid do produto (7 díg, compartilhado pelas variantes)
+          nome: g.nome,                // nome canônico, sem a cor e sem "personalizada"
+          personalizado: ehPers,
+          versao: ehPers ? 'personalizada' : 'normal',
+          categoria: rep.categoria,    // categoria da versão representada
+          preco: rep.preco,
+          preco_min: rep.preco_min,
+          preco_max: rep.preco_max,
+          disponivel: rep.disponivel,
+          total_cores: rep.total_cores,
+          cores: rep.cores,            // todas as cores da versão mostrada
+          cores_uids: rep.cores_uids,  // cor -> uid/preço/imagem de cada cor
+          descricao: rep.descricao,    // descrição COMPLETA da versão representada (nunca da outra)
           url: rep.url,
-          url_imagem: `${baseUrl}/api/produtos/imagem?id=${rep.id}`,
-          url_imagem_cdn: rep.imagem_principal,
-          // mapa cor -> uid real daquela cor (para escolher uma cor específica)
-          cores_uids: g.itens.map((p) => ({
-            cor: Array.isArray(p.cores) && p.cores.length ? p.cores.join(', ') : null,
-            uid: p.id,
-            preco: p.preco_min,
-            url: p.url,
-            url_imagem: `${baseUrl}/api/produtos/imagem?id=${p.id}`
-          }))
+          url_imagem: rep.url_imagem,
+          url_imagem_cdn: rep.url_imagem_cdn,
+          // versão personalizada equivalente (se existir): a IA usa para oferecer
+          // a personalização quando o cliente pedir.
+          tem_par: !!(repNormal && repPers),
+          versoes: { normal: repNormal, personalizada: repPers }
         };
       });
       grupados.sort((a, b) => a.preco_min - b.preco_min);
@@ -579,7 +703,7 @@ app.get('/api/produtos/buscar', async (req, res) => {
         agrupado: true,
         total: grupados.length,
         busca_ampliada: ampliou,
-        filtros: { q, cor, categoria, preco_min, preco_max, sku, id, limite: lim, agrupar: true },
+        filtros: { q, cor, categoria, preco_min, preco_max, sku, id, limite: lim, agrupar: true, personalizado },
         mensagem: grupados.length
           ? `${grupados.length} produto(s) encontrado(s) (cores agrupadas).`
           : 'Nenhum produto encontrado para os filtros informados.',
@@ -587,28 +711,51 @@ app.get('/api/produtos/buscar', async (req, res) => {
       });
     }
 
-    const produtos = (data || []).map((p) => ({
-      id: p.id,
-      uid: p.id, // identificador ÚNICO por produto (= id do Shopify, nunca colide)
-      nome: p.titulo,
-      descricao: stripHtml(p.descricao).slice(0, 300),
-      preco: p.preco_min,
-      sku: Array.isArray(p.variantes) && p.variantes[0] ? (p.variantes[0].sku || null) : null,
-      // url_imagem resolve a imagem pela id única (server-side). Qualquer node
-      // que baixe url_imagem pega o produto exato, sem depender do sku.
-      url_imagem: `${baseUrl}/api/produtos/imagem?id=${p.id}`,
-      url_imagem_cdn: p.imagem_principal, // link direto da CDN (referência/fallback)
-      cor: Array.isArray(p.cores) && p.cores.length ? p.cores.join(', ') : null,
-      categoria: p.tipo || null,
-      disponivel: p.status === 'active',
-      url: p.url
-    }));
+    // resolve as versões (normal/personalizada) de todos os nome_base do resultado
+    const versoesMap = await resolverVersoes((data || []).map((p) => p.nome_base), baseUrl);
+
+    const produtos = (data || []).map((p) => {
+      const par = versoesMap.get(p.nome_base) || { normal: null, personalizada: null };
+      // versão deste produto (normal/personalizada) já traz todas as cores do
+      // mesmo produto base — é o que a IA usa para saber as opções disponíveis.
+      const estaVersao = (p.personalizado ? par.personalizada : par.normal) || null;
+      return {
+        id: p.id, // id interno da variante (Shopify) — uso técnico/legado
+        uid: p.uid || String(p.id), // uid da VARIANTE: 9 díg (produto 7 + variante 2)
+        produto_uid: p.produto_uid || null, // uid do PRODUTO: 7 díg (compartilhado pelas variantes)
+        nome: p.titulo,
+        nome_base: p.nome_base || nomeBaseProduto(p.titulo, p.cores),
+        descricao: stripHtml(p.descricao) || null, // descrição completa (sem HTML)
+        categoria: p.tipo || null,
+        preco: p.preco_min,
+        preco_min: estaVersao ? estaVersao.preco_min : p.preco_min,
+        preco_max: estaVersao ? estaVersao.preco_max : p.preco_min,
+        sku: Array.isArray(p.variantes) && p.variantes[0] ? (p.variantes[0].sku || null) : null,
+        disponivel: p.status === 'active',
+        cor: Array.isArray(p.cores) && p.cores.length ? p.cores.join(', ') : null,
+        // todas as cores do MESMO produto (cada cor é um uid próprio):
+        cores_disponiveis: estaVersao ? estaVersao.cores : (Array.isArray(p.cores) ? p.cores.filter(Boolean) : []),
+        total_cores: estaVersao ? estaVersao.total_cores : (Array.isArray(p.cores) ? p.cores.filter(Boolean).length : 0),
+        cores_uids: estaVersao ? estaVersao.cores_uids : [], // cor -> uid/preço/imagem de cada cor
+        personalizado: !!p.personalizado,           // true = versão personalizada
+        versao: p.personalizado ? 'personalizada' : 'normal',
+        // versões equivalentes deste produto (a IA usa para trocar normal<->personalizada).
+        // tem_par = existe a outra versão (normal e personalizada ao mesmo tempo).
+        versoes: par,
+        tem_par: !!(par.normal && par.personalizada),
+        // url_imagem resolve a imagem pelo uid (server-side). Qualquer node que
+        // baixe url_imagem pega a variante exata.
+        url_imagem: `${baseUrl}/api/produtos/imagem?uid=${p.uid || p.id}`,
+        url_imagem_cdn: p.imagem_principal, // link direto da CDN (referência/fallback)
+        url: p.url
+      };
+    });
 
     res.json({
       ok: true,
       total: produtos.length,
       busca_ampliada: ampliou, // true quando relaxamos a query para não voltar vazio
-      filtros: { q, cor, categoria, preco_min, preco_max, sku, id, limite: lim },
+      filtros: { q, cor, categoria, preco_min, preco_max, sku, id, limite: lim, personalizado },
       mensagem: produtos.length
         ? `${produtos.length} produto(s) encontrado(s).`
         : 'Nenhum produto encontrado para os filtros informados.',
@@ -629,35 +776,34 @@ app.get('/api/produtos/buscar', async (req, res) => {
 app.get('/api/produtos/imagem', async (req, res) => {
   try {
     const { sku = '', id = '', uid = '', handle = '' } = req.query;
-    // uid é só um alias semântico de id (id do produto no Shopify)
-    const idLike = String(uid || id).trim();
+    // ref aceita o uid novo da variante (9 díg), o produto_uid (7 díg) ou o id antigo
+    const ref = String(uid || id).trim();
 
-    let query = supabase
-      .from('produtos')
-      .select('titulo,handle,imagem_principal,variantes')
-      .order('id', { ascending: true })
-      .limit(1);
-
-    if (idLike && /^\d+$/.test(idLike)) {
-      query = query.eq('id', Number(idLike));
+    let data = null;
+    if (ref) {
+      data = await acharLinhaPorRef(ref); // resolve uid/produto_uid/id
     } else if (handle) {
-      query = query.eq('handle', String(handle).trim());
+      const { data: rows, error } = await supabase
+        .from('produtos').select('titulo,handle,imagem_principal,variantes')
+        .eq('handle', String(handle).trim()).limit(1);
+      if (error) throw error;
+      data = rows?.[0] || null;
     } else if (sku) {
       // match do SKU dentro do array JSONB de variantes.
       // .contains() do supabase-js serializa errado p/ jsonb; usamos o
       // operador "cs" (@>) com a JSON string montada na mão.
-      query = query.filter('variantes', 'cs', JSON.stringify([{ sku: String(sku).trim() }]));
+      const { data: rows, error } = await supabase
+        .from('produtos').select('titulo,handle,imagem_principal,variantes')
+        .filter('variantes', 'cs', JSON.stringify([{ sku: String(sku).trim() }]))
+        .order('id', { ascending: true }).limit(1);
+      if (error) throw error;
+      data = rows?.[0] || null;
     } else {
-      return res.status(400).json({ ok: false, erro: 'Informe id, uid, handle ou sku.' });
+      return res.status(400).json({ ok: false, erro: 'Informe uid, id, handle ou sku.' });
     }
 
-    // não usamos .maybeSingle(): se o sku repetir, ele lançaria erro;
-    // com limit(1)+order, pegamos o 1º match de forma determinística.
-    const { data: rows, error } = await query;
-    if (error) throw error;
-    const data = Array.isArray(rows) ? rows[0] : rows;
     if (!data || !data.imagem_principal) {
-      return res.status(404).json({ ok: false, erro: 'Produto ou imagem não encontrada.', id: idLike, sku, handle });
+      return res.status(404).json({ ok: false, erro: 'Produto ou imagem não encontrada.', uid: ref, sku, handle });
     }
 
     // baixa a imagem da CDN e repassa os bytes com o content-type correto
@@ -690,63 +836,53 @@ app.get('/api/produtos/imagem', async (req, res) => {
 app.get('/api/produtos/ficha', async (req, res) => {
   try {
     const { uid = '', id = '', handle = '' } = req.query;
-    const idLike = String(uid || id).trim();
+    const ref = String(uid || id).trim();
 
-    let query = supabase
-      .from('produtos')
-      .select('id,handle,titulo,descricao,preco_min,imagem_principal,cores,tipo,status,url,variantes')
-      .limit(1);
+    let data = null;
+    if (ref) {
+      data = await acharLinhaPorRef(ref); // resolve uid/produto_uid/id
+    } else if (handle) {
+      const { data: rows, error } = await supabase.from('produtos').select('*')
+        .eq('handle', String(handle).trim()).limit(1);
+      if (error) throw error;
+      data = rows?.[0] || null;
+    } else {
+      return res.status(400).json({ ok: false, erro: 'Informe uid, id ou handle.' });
+    }
+    if (!data) return res.status(404).json({ ok: false, erro: 'Produto não encontrado.', uid: ref });
 
-    if (idLike && /^\d+$/.test(idLike)) query = query.eq('id', Number(idLike));
-    else if (handle) query = query.eq('handle', String(handle).trim());
-    else return res.status(400).json({ ok: false, erro: 'Informe uid, id ou handle.' });
+    // versões equivalentes (normal/personalizada) via nome_base canônico; a versão
+    // deste produto já traz todas as cores (com os uids novos) — usamos isso.
+    const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+    const baseUrl = `${proto}://${req.get('host')}`;
+    const nbCanonico = data.nome_base || nomeBaseProduto(data.titulo, data.cores);
+    const par = (await resolverVersoes([nbCanonico], baseUrl)).get(nbCanonico) || { normal: null, personalizada: null };
+    const estaVersao = (data.personalizado ? par.personalizada : par.normal) || null;
 
-    const { data, error } = await query.maybeSingle();
-    if (error) throw error;
-    if (!data) return res.status(404).json({ ok: false, erro: 'Produto não encontrado.', uid: idLike });
-
-    const stripHtml = (h) => (h || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-    const deburr = (s) => String(s).normalize('NFD').replace(/[̀-ͯ]/g, '');
-
-    // Cores disponíveis do MESMO produto base (cada cor é uma linha separada).
-    const baseNome = nomeBaseProduto(data.titulo, data.cores);
-    let cores_disponiveis = Array.isArray(data.cores) ? data.cores.filter(Boolean) : [];
-    let cores_uids = [{ cor: cores_disponiveis.join(', ') || null, uid: data.id }];
-    try {
-      let qy = supabase
-        .from('produtos')
-        .select('id,titulo,cores')
-        .ilike('titulo', `${baseNome.replace(/[%_]/g, ' ').trim()}%`)
-        .not('imagem_principal', 'is', null)
-        .limit(60);
-      if (data.tipo) qy = qy.eq('tipo', data.tipo);
-      const { data: irmaos } = await qy;
-      const mesmos = (irmaos || []).filter(
-        (p) => deburr(nomeBaseProduto(p.titulo, p.cores).toLowerCase()) === deburr(baseNome.toLowerCase())
-      );
-      if (mesmos.length) {
-        cores_disponiveis = [...new Set(mesmos.flatMap((p) => (Array.isArray(p.cores) ? p.cores : [])).filter(Boolean))];
-        cores_uids = mesmos.map((p) => ({
-          cor: Array.isArray(p.cores) && p.cores.length ? p.cores.join(', ') : null,
-          uid: p.id
-        }));
-      }
-    } catch (_) { /* fallback: só a cor do próprio produto */ }
+    const coresProprias = Array.isArray(data.cores) ? data.cores.filter(Boolean) : [];
+    const cores_disponiveis = estaVersao ? estaVersao.cores : coresProprias;
+    const cores_uids = estaVersao ? estaVersao.cores_uids
+      : [{ cor: coresProprias.join(', ') || null, uid: data.uid || String(data.id) }];
 
     res.json({
       ok: true,
-      uid: data.id,
+      uid: data.uid || String(data.id),         // uid da VARIANTE (9 díg)
+      produto_uid: data.produto_uid || null,    // uid do PRODUTO (7 díg)
       nome: data.titulo,
-      nome_base: baseNome,                      // nome sem a cor (para apresentar)
+      nome_base: nbCanonico,                    // nome canônico (sem cor e sem "personalizada"): liga o par
+      personalizado: !!data.personalizado,      // true = versão personalizada
+      versao: data.personalizado ? 'personalizada' : 'normal',
+      versoes: par,                             // { normal, personalizada } — para trocar de versão
+      tem_par: !!(par.normal && par.personalizada),
       preco: data.preco_min,
       sku: Array.isArray(data.variantes) && data.variantes[0] ? (data.variantes[0].sku || null) : null,
       cor: Array.isArray(data.cores) && data.cores.length ? data.cores.join(', ') : null,
-      cores_disponiveis,                        // todas as cores do produto base
+      cores_disponiveis,                        // todas as cores do produto (versão)
       total_cores: cores_disponiveis.length,
-      cores_uids,                               // mapa cor -> uid real de cada cor
+      cores_uids,                               // mapa cor -> uid (9 díg) de cada cor
       categoria: data.tipo || null,
       disponivel: data.status === 'active',
-      descricao: stripHtml(data.descricao).slice(0, 300) || null,
+      descricao: stripHtml(data.descricao) || null, // descrição completa (sem HTML)
       url: data.url || null,                  // link do produto no site
       url_imagem: data.imagem_principal || null // link DIRETO da imagem na CDN da Shopify
     });
@@ -862,17 +998,16 @@ app.get('/api/catalogo', async (req, res) => {
 // Acionar quando for ENVIAR o orçamento ao lead.
 app.get('/api/orcamento/calcular', async (req, res) => {
   try {
-    const { lead_id, cores = 1, estrategia = 'padrao' } = req.query;
+    const { lead_id, estrategia = 'padrao' } = req.query;
     if (!lead_id || !/^\d+$/.test(String(lead_id).trim())) {
       return res.status(400).json({ ok: false, erro: 'lead_id (numérico) é obrigatório', itens: [] });
     }
     const est = ['teto', 'padrao', 'piso'].includes(estrategia) ? estrategia : 'padrao';
-    const nCores = Math.max(parseInt(cores) || 1, 1);
 
     // 1) Itens do orçamento do lead
     const { data: itensRaw, error } = await supabaseAdmin
       .from('info_orcamento')
-      .select('product_name,product_price,product_quantity,design_info,product_sku,is_personalized')
+      .select('product_name,product_price,product_quantity,design_info,product_uid,is_personalized')
       .eq('lead_id', Number(lead_id));
     if (error) throw error;
 
@@ -899,32 +1034,21 @@ app.get('/api/orcamento/calcular', async (req, res) => {
       const custoUnit = parseFloat(it.product_price) || 0;
       const personalizado = !!it.is_personalized;
 
-      let impr = { custoImprUnit: 0, tecnica: null, area: null, colors: 0, fonte: null };
-      if (personalizado) {
-        const ref = extrairRef(it.product_sku);
-        const imprObj = ref ? IMPRESSAO[ref] : null;
-        impr = custoImpressao(imprObj, it.product_name || '', nCores, qtd);
-      }
-
-      const r = calcPrice(custoUnit, qtd, impr.custoImprUnit, est);
+      // O preço do produto (inclusive das versões "Personalizada") JÁ inclui a
+      // impressão/personalização. Portanto NÃO somamos custo de impressão aqui:
+      // a calculadora apenas aplica o markup sobre o custo do produto.
+      const r = calcPrice(custoUnit, qtd, 0, est);
       totalGeral += r.total;
       custoGeral += r.custoTotalReal;
 
       return {
         produto: it.product_name,
-        sku: it.product_sku,
-        ref: extrairRef(it.product_sku) || null,
+        product_uid: it.product_uid || null,
         quantidade: qtd,
         custo_unit: +custoUnit.toFixed(2),
         personalizado,
         design_info: it.design_info || null,
-        tecnica: personalizado ? impr.tecnica : null,
-        area_impressao: personalizado ? impr.area : null,
-        cores: personalizado ? impr.colors : 0,
-        custo_impressao_unit: +impr.custoImprUnit.toFixed(2),
-        fonte_impressao: personalizado ? impr.fonte : null,
         markup_produto: r.mkProd,
-        markup_impressao: r.mkImpr,
         preco_unit: +r.unit.toFixed(2),
         subtotal: +r.total.toFixed(2),
         margem: +(r.margem * 100).toFixed(1)
@@ -937,7 +1061,7 @@ app.get('/api/orcamento/calcular', async (req, res) => {
     // 4) Texto pronto para enviar ao lead
     const fmt = (v) => 'R$ ' + (Number(v) || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     const linhas = itens.map((i) =>
-      `• ${i.quantidade}x ${i.produto}${i.personalizado ? ` (${i.tecnica}${i.cores ? `, ${i.cores} cor(es)` : ''})` : ''} — ${fmt(i.preco_unit)}/un = ${fmt(i.subtotal)}`
+      `• ${i.quantidade}x ${i.produto} — ${fmt(i.preco_unit)}/un = ${fmt(i.subtotal)}`
     );
     const orcamento_texto =
       `Orçamento${cliente ? ' — ' + cliente : ''}:\n` +
@@ -950,7 +1074,6 @@ app.get('/api/orcamento/calcular', async (req, res) => {
       lead_id: Number(lead_id),
       cliente,
       estrategia: est,
-      cores_logo: nCores,
       itens,
       totais: {
         qtd_itens: itens.length,
