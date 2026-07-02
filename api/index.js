@@ -673,27 +673,19 @@ app.get('/api/produtos/buscar', async (req, res) => {
         const rep = repNormal || repPers;       // prioriza a versão NORMAL
         const ehPers = !repNormal;               // só personalizado quando não há normal
         return {
-          uid: rep.uid,                // uid da variante representativa (9 díg)
-          produto_uid: rep.produto_uid, // uid do produto (7 díg, compartilhado pelas variantes)
+          uid: rep.uid,                // uid da variante representativa (identificador único)
           nome: g.nome,                // nome canônico, sem a cor e sem "personalizada"
-          personalizado: ehPers,
-          versao: ehPers ? 'personalizada' : 'normal',
-          categoria: rep.categoria,    // categoria da versão representada
-          preco: rep.preco,
-          preco_min: rep.preco_min,
-          preco_max: rep.preco_max,
-          disponivel: rep.disponivel,
-          total_cores: rep.total_cores,
-          cores: rep.cores,            // todas as cores da versão mostrada
-          cores_uids: rep.cores_uids,  // cor -> uid/preço/imagem de cada cor
           descricao: rep.descricao,    // descrição COMPLETA da versão representada (nunca da outra)
-          url: rep.url,
+          preco: rep.preco,
+          categoria: rep.categoria,
+          disponivel: rep.disponivel,
+          cores: rep.cores,            // todas as cores da versão mostrada
           url_imagem: rep.url_imagem,
-          url_imagem_cdn: rep.url_imagem_cdn,
-          // versão personalizada equivalente (se existir): a IA usa para oferecer
-          // a personalização quando o cliente pedir.
-          tem_par: !!(repNormal && repPers),
-          versoes: { normal: repNormal, personalizada: repPers }
+          url: rep.url,
+          personalizado: ehPers,
+          // tem_par = existe também a outra versão (normal/personalizada). Se true,
+          // busque com personalizado=true/false para pegar a versão desejada.
+          tem_par: !!(repNormal && repPers)
         };
       });
       grupados.sort((a, b) => a.preco_min - b.preco_min);
@@ -720,33 +712,21 @@ app.get('/api/produtos/buscar', async (req, res) => {
       // mesmo produto base — é o que a IA usa para saber as opções disponíveis.
       const estaVersao = (p.personalizado ? par.personalizada : par.normal) || null;
       return {
-        id: p.id, // id interno da variante (Shopify) — uso técnico/legado
-        uid: p.uid || String(p.id), // uid da VARIANTE: 9 díg (produto 7 + variante 2)
-        produto_uid: p.produto_uid || null, // uid do PRODUTO: 7 díg (compartilhado pelas variantes)
+        uid: p.uid || String(p.id), // identificador único da variante
         nome: p.titulo,
-        nome_base: p.nome_base || nomeBaseProduto(p.titulo, p.cores),
         descricao: stripHtml(p.descricao) || null, // descrição completa (sem HTML)
-        categoria: p.tipo || null,
         preco: p.preco_min,
-        preco_min: estaVersao ? estaVersao.preco_min : p.preco_min,
-        preco_max: estaVersao ? estaVersao.preco_max : p.preco_min,
-        sku: Array.isArray(p.variantes) && p.variantes[0] ? (p.variantes[0].sku || null) : null,
+        categoria: p.tipo || null,
         disponivel: p.status === 'active',
         cor: Array.isArray(p.cores) && p.cores.length ? p.cores.join(', ') : null,
-        // todas as cores do MESMO produto (cada cor é um uid próprio):
+        // todas as cores do MESMO produto:
         cores_disponiveis: estaVersao ? estaVersao.cores : (Array.isArray(p.cores) ? p.cores.filter(Boolean) : []),
-        total_cores: estaVersao ? estaVersao.total_cores : (Array.isArray(p.cores) ? p.cores.filter(Boolean).length : 0),
-        cores_uids: estaVersao ? estaVersao.cores_uids : [], // cor -> uid/preço/imagem de cada cor
         personalizado: !!p.personalizado,           // true = versão personalizada
-        versao: p.personalizado ? 'personalizada' : 'normal',
-        // versões equivalentes deste produto (a IA usa para trocar normal<->personalizada).
-        // tem_par = existe a outra versão (normal e personalizada ao mesmo tempo).
-        versoes: par,
+        // tem_par = existe também a outra versão (normal/personalizada). Se true,
+        // busque com personalizado=true/false para pegar a versão desejada.
         tem_par: !!(par.normal && par.personalizada),
-        // url_imagem resolve a imagem pelo uid (server-side). Qualquer node que
-        // baixe url_imagem pega a variante exata.
+        // url_imagem resolve a imagem pelo uid (server-side, pega a variante exata):
         url_imagem: `${baseUrl}/api/produtos/imagem?uid=${p.uid || p.id}`,
-        url_imagem_cdn: p.imagem_principal, // link direto da CDN (referência/fallback)
         url: p.url
       };
     });
